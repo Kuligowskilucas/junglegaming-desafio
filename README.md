@@ -2,7 +2,7 @@
 
 Serviço financeiro distribuído que processa transações de apostas (BET, WIN, LOSS, REFUND, ROLLBACK) de múltiplos provedores, com idempotência persistente, ledger imutável e transactional outbox. O enunciado completo está em [`docs/DESAFIO.md`](docs/DESAFIO.md). As decisões técnicas e os trade-offs estão em [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
-**Status:** Etapa 1 (fundação) concluída: infra local, aplicação NestJS em Bun, config validada, MikroORM com migrations, health checks, logs JSON e testes contra a infra real.
+**Status:** Etapas 1 (fundação) e 2 (domínio puro) concluídas: infra local, aplicação NestJS em Bun, config validada, MikroORM com migrations, health checks, logs JSON e o modelo de domínio (Money, Wallet, ledger, WagerTransaction, regras de BET/WIN/LOSS/REFUND/ROLLBACK, inbox, outbox e eventos), com testes unitários e de arquitetura.
 
 ## Pré-requisitos
 
@@ -47,7 +47,7 @@ docker compose exec sqs sh -c 'awslocal sqs get-queue-attributes --attribute-nam
 | `bun run start` | Sobe a API sem reload |
 | `bun run typecheck` | `tsc --noEmit` (TypeScript 6.0.3, modo estrito) |
 | `bun test` | Todos os testes (unitários e de integração) |
-| `bun run test:unit` | Só os testes sem I/O |
+| `bun run test:unit` | Só os testes sem I/O (domínio, arquitetura, config) |
 | `bun run test:integration` | Só os testes contra Postgres e SQS reais |
 | `bun run db:migrate` | Aplica as migrations pendentes |
 | `bun run db:migrate:down` | Reverte a última migration |
@@ -58,7 +58,7 @@ Para rodar as migrations no banco de testes: `NODE_ENV=test bun run db:migrate`.
 
 ## Testes
 
-- **Unitários** (`test/unit`) não fazem I/O.
+- **Unitários** (`test/unit`) não fazem I/O e não precisam da infra: domínio (`test/unit/domain`, incluindo regras de negócio, transições de status, hash de payload e um teste de propriedade do ledger com seed fixa), regra de dependência entre camadas (`test/unit/architecture`) e config.
 - **Integração** (`test/integration`) usam PostgreSQL e LocalStack reais, sem mocks. A infra precisa estar de pé (`docker compose up -d --wait`). Se não estiver, o teste falha na hora com essa instrução.
 - O `bun test` define `NODE_ENV=test` e carrega o `.env.test` por cima do `.env`. Os testes usam o banco **`wagering_test`**, criado pelo init do Postgres, e não tocam no banco de desenvolvimento.
 - **Sem paralelismo entre arquivos que limpam o banco.** O `bun test` roda os arquivos em série por padrão, e os scripts nunca passam `--parallel`. Além disso, todo arquivo de integração chama `useIntegrationEnvironment()` (`test/support/integration.ts`). Ela toma um advisory lock no Postgres (`pg_advisory_lock`) numa conexão dedicada durante o arquivo inteiro. Mesmo com `bun test --parallel`, os arquivos de integração esperam uns pelos outros em vez de mexer nos dados de outro teste.

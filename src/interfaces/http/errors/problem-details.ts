@@ -23,7 +23,7 @@ export function problemDetails(
   description: ProblemDescription,
   request: { instance: string; correlationId: string | undefined },
 ): ProblemDetails {
-  return {
+  const standard = {
     type: `urn:wagering:problem:${description.code.toLowerCase().replaceAll("_", "-")}`,
     title: description.title,
     status: description.status,
@@ -32,6 +32,6 @@ export function problemDetails(
     code: description.code,
     retryable: description.retryable ?? false,
     correlationId: request.correlationId,
-    ...description.extensions,
   };
+  return { ...standard, ...description.extensions, ...standard };
 }

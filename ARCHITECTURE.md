@@ -125,7 +125,7 @@ Formato: uma linha JSON por evento com `level` (label), `time` (ISO-8601), `serv
 - **correlationId:** vem do header `x-correlation-id` quando bate com `^[A-Za-z0-9._:-]{1,128}$`, o que impede injeção de conteúdo arbitrário no log. Caso contrário, é gerado um UUID. O valor volta no header da resposta e aparece em todo log emitido durante a requisição.
 - **Dados sensíveis:** os serializers de request e response são allowlist, só `method`, `url` e `statusCode`. Headers e corpo nunca são logados. Isso é mais forte que redaction, porque nada entra por padrão.
 - `/health/*` fica fora do log automático de request, para não poluir com os probes. Falhas de readiness são logadas em `warn`, com a causa.
-- Na Etapa 5, o consumer SQS e os workers usam `PinoLogger.runInContext(fn, { bindings: { correlationId, messageId, ... } })`, e os campos `transactionId`, `walletId` e `providerId` entram via `assign` no caso de uso.
+- Na Etapa 5, o consumer SQS e os workers passaram a usar `PinoLogger.runInContext(fn, { bindings: { correlationId, messageId, ... } })`. Na Etapa 6a, `transactionId`, `walletId` e `providerId` entraram via `assign` em todos os caminhos, e o serializer de erros virou allowlist com máscara de valores (D47).
 
 ### D6. Health checks
 
@@ -298,7 +298,7 @@ Factories e transições recebem `id`, `entryId` e `at` explicitamente. Os teste
 
 ### D15. Backoff do outbox e erros de domínio
 
-- **`OutboxMessage.scheduleRetry(now)`:** `attempts + 1` e próxima tentativa em `min(1 s × 2^(attempts−1), 5 min)`, sem jitter. **Sem limite de tentativas:** um evento confirmado nunca é descartado. Depois do teto, continua tentando a cada 5 min, e o atraso aparece na métrica de outbox lag (Etapa 6). O jitter só ajudaria com muitos publishers sincronizados, e cada linha tem a própria agenda. O `OutboxMessage.enqueue(event)` usa `eventId` como id e guarda `event.toJSON()` congelado como payload.
+- **`OutboxMessage.scheduleRetry(now)`:** `attempts + 1` e próxima tentativa em `min(1 s × 2^(attempts−1), 5 min)`, sem jitter. **Sem limite de tentativas:** um evento confirmado nunca é descartado. Depois do teto, continua tentando a cada 5 min, e o atraso aparece na métrica de outbox lag (`wagering_outbox_oldest_pending_age_seconds`, D44). O jitter só ajudaria com muitos publishers sincronizados, e cada linha tem a própria agenda. O `OutboxMessage.enqueue(event)` usa `eventId` como id e guarda `event.toJSON()` congelado como payload.
 - **`DomainError`** (com `code`; vira 4xx na Etapa 4): `InvalidMoneyError`, `CurrencyMismatchError`, `InvalidWagerTransactionError`.
 - **`InvariantViolationError`** (bug do chamador; vira 500): `InvalidTransactionStateError`, `InvalidOutboxStateError`, `InvalidInboxStateError`, `InsufficientBalanceError`, `InvalidLedgerEntryError`, `InvalidOperationError`.
 - Eventos de integração: cada subclasse fixa `eventType` e `version = 1` no tipo. O `data` carrega só `MoneyProps` e strings ISO-8601, é congelado em profundidade e o `from` recusa um agregado no estado errado. O `WalletBalanceChanged.from` exige que o lançamento seja o último movimento da wallet, para que `walletVersion` e `balanceAfter` sejam coerentes.
@@ -475,7 +475,7 @@ Etapa 4: o caso de uso `SubmitWagerTransaction` (`src/application/wagering`), re
 
 ### D26. Lock timeout
 
-`DB_LOCK_TIMEOUT_MS` (padrão 2000) vai para todas as conexões do pool como `driverOptions.options = '-c lock_timeout=<ms>'`, sem SQL cru. Esperar mais que isso pelo lock de uma wallet dá `55P03 lock_not_available`. Como o MikroORM não converte esse código, ele foi incluído em `isTransientDatabaseError`, e o filtro responde **503 `DEPENDENCY_UNAVAILABLE`, `retryable: true`, `Retry-After: 1`**. Nada é gravado, então reenviar a mesma requisição é seguro. Por que 2 s: cada transação segura o lock por milissegundos, então 2 s de espera já indicam saturação, e um 503 explícito é melhor que esgotar o pool. Testado com uma sessão segurando `FOR UPDATE` e a app com 300 ms: 503; depois de soltar o lock, o reenvio processa.
+`DB_LOCK_TIMEOUT_MS` (padrão 2000) vai para todas as conexões do pool como `driverOptions.options = '-c lock_timeout=<ms>'`, sem SQL cru. Esperar mais que isso pelo lock de uma wallet dá `55P03 lock_not_available`. Como o MikroORM não converte esse código, ele foi incluído em `isTransientDatabaseError`, e o filtro responde **503 `DEPENDENCY_UNAVAILABLE`, `retryable: true`, `Retry-After: 1`**. Nada é gravado, então reenviar a mesma requisição é seguro. Por que 2 s: cada transação segura o lock por milissegundos, então 2 s de espera já indicam saturação, e um 503 explícito é melhor que esgotar o pool. Testado com uma sessão segurando `FOR UPDATE` e a app com 300 ms: 503; depois de soltar o lock, o reenvio processa. Desde a Etapa 6a, cada timeout desses conta em `wagering_lock_conflicts_total` (D45).
 
 **Nos testes de concorrência, o cliente reenvia automaticamente ao receber 503, respeitando o `Retry-After`**, como um provedor faria. Os resultados esperados continuam exatos porque o reenvio é idempotente. Cada cenário registra quantos 503 recebeu, e o resumo sai no fim da execução. Nas execuções desta etapa (pool de 20, lock timeout de 2 s), **todos os cenários tiveram 0 reenvios**: seção 8, mesma aposta 50×, wallet quente com 120 BETs, 10 wallets × 20 BETs, REFUND × ROLLBACK, mesma key em wallets diferentes e mesmo id externo com keys diferentes. A suíte rodou 5 vezes seguidas sem falha.
 
@@ -550,7 +550,7 @@ São três camadas:
 | Banco indisponível, `55P03` (lock timeout), deadlock, falha do SQS | transitório | backoff (D31) |
 | Qualquer outro erro (bug, invariante) | desconhecido → **transitório** | backoff; se persistir, DLQ pelo `maxReceiveCount`. Nunca é descartado |
 
-**Destino dos erros não persistidos: DLQ explícita com atributos.** A mensagem vai para a DLQ com `MessageAttributes` `errorCode`, `errorMessage`, `consumerName`, `failedAt` e `receiveCount`, e então é apagada da fila principal. É a classificação do enunciado ("permanentes → DLQ"). Isso tira a mensagem do fluxo na hora, sem bloquear o grupo da wallet com reentregas inúteis, e a DLQ (14 dias) é a trilha de auditoria. A métrica de mensagens em DLQ (E6) alerta a operação. Alternativa descartada: ack + evento `WagerTransactionRequestRejected`, que criaria um evento fora do conjunto mínimo e não serviria para envelope ilegível. **Limitação:** o provedor não é avisado automaticamente de uma mensagem que foi para a DLQ.
+**Destino dos erros não persistidos: DLQ explícita com atributos.** A mensagem vai para a DLQ com `MessageAttributes` `errorCode`, `errorMessage`, `consumerName`, `failedAt` e `receiveCount`, e então é apagada da fila principal. É a classificação do enunciado ("permanentes → DLQ"). Isso tira a mensagem do fluxo na hora, sem bloquear o grupo da wallet com reentregas inúteis, e a DLQ (14 dias) é a trilha de auditoria. A métrica de mensagens em DLQ (`wagering_sqs_queue_messages{queue="requests_dlq"}`, D44) alerta a operação. Alternativa descartada: ack + evento `WagerTransactionRequestRejected`, que criaria um evento fora do conjunto mínimo e não serviria para envelope ilegível. **Limitação:** o provedor não é avisado automaticamente de uma mensagem que foi para a DLQ.
 
 ### D31. Backoff e DLQ
 
@@ -728,14 +728,167 @@ A proposta original era usar o id da transação como `correlationId` dos evento
 - **Worker** (`test/integration/workers/pending-reference-worker.test.ts`): REFUND antes da BET (com o `correlationId` original nos eventos), ROLLBACK antes do WIN (DEBIT), empurrão de uma dependente com backoff de 1 h, novas tentativas sem a referência (backoff exato e nenhum evento novo), limite esgotado (REJECTED `REFERENCE_NOT_FOUND`, evento e replay 422), replay depois da resolução, worker e 20 BETs HTTP simultâneas na mesma wallet, e dois workers sobre as mesmas 10 dependentes.
 - Depois de cada teste, o saldo de todas as wallets é conferido contra o ledger.
 
-## 9. Autenticação
+## 9. Reconciliação, métricas e logs
+
+Etapa 6a: o endpoint de reconciliação (seção 9 do enunciado), as métricas da seção 12 e a revisão dos logs em todos os caminhos.
+
+### D42. Reconciliação sem bloquear escritas (P1)
+
+**Contrato** (formato da seção 9, sem campos extras): `POST /wallets/:walletId/reconciliation`, sem corpo, atrás do `AuthGuard` como as outras rotas de wallet.
+- **`calculatedBalance`:** Σ CREDIT − Σ DEBIT de todos os lançamentos da wallet, inclusive o OPENING.
+- **`difference`:** `storedBalance − calculatedBalance`. Positivo significa saldo sem lastro no ledger.
+- **`checkedEntries`:** quantos lançamentos foram somados.
+
+**Resposta:**
+- **Sempre 200**, com `consistent: true` ou `false` (P1): a verificação funcionou, e a divergência é o dado que ela devolve.
+- **404 `WALLET_NOT_FOUND`** e **400 `VALIDATION_FAILED`** como nas outras rotas.
+- **Divergência:** a resposta a sinaliza, um log `error` a registra (D47), `wagering_reconciliations_total{result="inconsistent"}` a conta, e **nada é corrigido**.
+
+**Camadas:**
+- **`WalletReconciliation`** (domínio): value object com `compare(...)`, que calcula `difference` e `consistent` e recusa moedas diferentes.
+- **`WalletLedgerRepository.summarize(walletId, currency)`** (porta): a soma roda no Postgres, em `numeric` (exato), sem trazer o ledger para a memória. O adaptador usa o Kysely tipado do MikroORM, sem SQL cru, e aceita soma negativa, que só um ledger corrompido produz.
+- **`ReconcileWallet`** (aplicação): lê a wallet e a soma dentro de `TransactionRunner.readSnapshot`.
+
+**Leitura consistente:**
+
+| Opção | Resultado |
+|---|---|
+| **`REPEATABLE READ READ ONLY` (escolhida)** | Saldo e soma vêm do mesmo snapshot MVCC; nada é travado, então as escritas seguem e a reconciliação não espera lock; a intenção fica explícita (`readSnapshot` → `em.transactional(work, { isolationLevel: REPEATABLE_READ, readOnly: true })`). Por ser só leitura, nunca recebe erro de serialização |
+| Uma instrução só (JOIN + agregado) em READ COMMITTED | Também é um snapshot só, mas a garantia fica implícita: separar a consulta em duas quebra a consistência sem que ninguém perceba |
+| Travar a wallet (`FOR SHARE`/`FOR UPDATE`) | Bloqueia as escritas durante a soma; numa wallet quente, gera 503 |
+| Corte por versão (`wallet_version <= versão lida`) | Esconde justamente a corrupção "lançamento além da versão da wallet" |
+
+O `findById` da wallet passou a usar `refresh: true`, para que o identity map não devolva uma wallet lida antes do snapshot.
+
+**Verificado:**
+- **Teste determinístico** (`test/integration/application/reconcile-wallet.test.ts`): uma subclasse do repositório real confirma uma BET por HTTP entre a leitura da wallet e a soma. Com `REPEATABLE READ`, a reconciliação vê 100.00 dos dois lados. Trocando por READ COMMITTED, o mesmo teste acusa uma **divergência falsa de 10.00**.
+- **Escrita em andamento:** com outra sessão segurando a wallet com um UPDATE não confirmado, a reconciliação respondeu em menos de 1 s com o estado confirmado.
+- **Teste HTTP concorrente** (20 BETs e 20 reconciliações em paralelo, todas consistentes): continua na suíte como fumaça, mas **não discrimina** o nível de isolamento, porque também passou com READ COMMITTED; a janela entre as duas leituras é curta demais. A prova é o teste determinístico.
+
+**Como o teste cria a divergência:** os triggers de coerência (D17) impedem uma divergência por qualquer caminho normal.
+
+| Opção | Resultado |
+|---|---|
+| **`SET LOCAL session_replication_role = replica` + `UPDATE wallets` (escolhida)** | Desliga os triggers **só naquela transação da sessão de teste**, sem DDL e sem afetar outras conexões; exercita o endpoint, o log e a métrica reais. Exige superusuário, que é o usuário do container (`rolsuper = t`). O teste restaura o saldo do mesmo jeito num `finally` |
+| `ALTER TABLE … DISABLE TRIGGER` | DDL com `ACCESS EXCLUSIVE`, vale para todas as sessões enquanto dura |
+| Repositório falso | É mock no lugar do Postgres |
+
+É ferramenta de teste e de diagnóstico manual; a aplicação nunca faz isso.
+
+### D43. Métricas: biblioteca, formato e catálogo (P5, P6)
+
+| Opção | Resultado |
+|---|---|
+| **`prom-client` 15.1.3, formato de exposição do Prometheus em `GET /metrics` (escolhida)** | Padrão de fato; Counter, Gauge e Histogram prontos; texto que Prometheus, Grafana Agent e OTel Collector leem. As métricas padrão de processo (CPU, memória, event loop, heap) **funcionam no Bun 1.4.2** (verificado, P6) e estão incluídas |
+| `@willsoto/nestjs-prometheus` | Mais uma dependência por um controller pequeno |
+| SDK de métricas do OpenTelemetry | Várias dependências e compatibilidade incerta com o Bun, além do pedido |
+
+**Desenho:**
+- **Um `Registry` por instância da app** (provider do `MetricsModule`), e não o registro global do `prom-client`. Os testes sobem várias apps no mesmo processo, e o registro global daria "metric already registered".
+- **`WageringMetrics`** concentra os contadores e histogramas, com métodos semânticos.
+- **Domínio e aplicação não conhecem métricas.** Quem registra é a borda (controllers, consumer, workers), a partir do resultado que os casos de uso já devolvem, sempre depois do COMMIT. As exceções, ambas em adaptadores, são o conflito de lock (D45) e a espera do lock da wallet.
+- **Rótulos só de conjuntos fechados, nunca ids**, o que evita cardinalidade explosiva e dado identificável na métrica.
+
+| Métrica | Tipo | Rótulos | O que mede |
+|---|---|---|---|
+| `wagering_transactions_total` | counter | `source` (http, sqs, worker), `kind`, `status`, `failure_code` (`none` se não rejeitada) | Transações que **entraram** num status, inclusive o OPENING. Replays não contam; a nova tentativa do worker que continua pendente vai para retries |
+| `wagering_duplicates_total` | counter | `source`, `type` (`idempotent_replay`, `inbox`) | Replays idempotentes (inclusive pelo caminho da unique) e duplicatas do inbox |
+| `wagering_retries_total` | counter | `component` (`sqs_consumer`, `outbox_publisher`, `reference_worker`), `reason` | Retry agendado pelo consumer (código da falha), cada `scheduleRetry` do publisher (`PUBLISH_FAILED`) e reavaliação sem referência (`REFERENCE_MISSING`); falhas de ciclo como `DEPENDENCY_UNAVAILABLE`/`UNEXPECTED_ERROR` |
+| `wagering_dead_lettered_total` | counter | `code` | Mensagens que o consumer mandou explicitamente para a DLQ |
+| `wagering_lock_conflicts_total` | counter | `type` (`timeout`, `deadlock`) | D45 |
+| `wagering_reconciliations_total` | counter | `result` | Cada reconciliação |
+| `wagering_metrics_probe_failures_total` | counter | `probe` (`outbox`, `pending_references`, `sqs`) | Sonda do scrape que falhou ou estourou o tempo (D44) |
+| `wagering_processing_duration_seconds` | histogram | `source`, `result` | **Latência de processamento:** o caso de uso no HTTP; do recebimento ao ack, retry ou DLQ no consumer; cada liquidação no worker. `result`: status final, `REPLAY`, `DUPLICATE`, `RETRY`, `DEAD_LETTER` ou `ERROR` |
+| `wagering_outbox_publication_delay_seconds` | histogram | — | `published_at − occurred_at` de cada evento |
+| `wagering_wallet_lock_wait_seconds` | histogram | — | Duração do `SELECT … FOR UPDATE` da wallet: contenção **antes** de virar timeout (P5) |
+| `wagering_outbox_pending_events` | gauge | — | Eventos pendentes no outbox (D44) |
+| `wagering_outbox_oldest_pending_age_seconds` | gauge | — | **Outbox lag:** idade do pendente mais antigo, 0 quando vazio (D44) |
+| `wagering_pending_reference_transactions` | gauge | — | Backlog do worker de PENDING_REFERENCE (P5) |
+| `wagering_sqs_queue_messages` | gauge | `queue` (`requests`, `requests_dlq`, `events`), `state` (`visible`, `in_flight`) | Profundidade das filas; **`queue="requests_dlq"` é a métrica de mensagens em DLQ** (D44) |
+
+**Várias instâncias:** cada uma expõe os próprios contadores e histogramas (somar com `sum`/`rate`), e os gauges consultados no banco ou no SQS saem iguais em todas (agregar com `max`). Contadores voltam a zero no restart do processo, o que o `rate()` do Prometheus já trata.
+
+### D44. Outbox lag e DLQ medidos no scrape
+
+| Opção | Resultado |
+|---|---|
+| **Consultar no scrape, com timeout por sonda (escolhida)** | Valor sempre atual; nenhum laço nem conexão extra além do request do scrape; consultas baratas (índice parcial dos pendentes do outbox e de PENDING_REFERENCE, `GetQueueAttributes`) |
+| Amostrador em segundo plano | Mais um laço e uma conexão (entraria na conta do pool, D40), com valor até N s velho |
+| Só o histograma de atraso de publicação | Com o publisher parado, nada é publicado e o histograma fica quieto, justamente quando mais importa alarmar. Ele complementa o gauge, mas não o substitui |
+
+**Mecanismo:** o `MetricsController` chama `BacklogGauges.refresh()` e só depois serializa o registro.
+- `refresh()` roda em paralelo uma consulta ao outbox (`count(*)` e `min(occurred_at)` dos pendentes), a contagem de PENDING_REFERENCE e um `GetQueueAttributes` por fila, cada sonda limitada por `HEALTH_CHECK_TIMEOUT_MS`.
+- **Por que não o `collect()` assíncrono dos gauges:** o `prom-client` lê os contadores antes de os `collect()` terminarem, então a falha de uma sonda só aparecia no scrape seguinte (o teste pegou isso). Com o `refresh()` explícito, a ordem é determinística, e os dois gauges do outbox saem de uma única consulta.
+- **Numa falha:** o gauge da sonda vira **`NaN`**, `wagering_metrics_probe_failures_total{probe}` sobe, um `warn` vai para o log e o resto do `/metrics` responde normalmente. `NaN`, e não 0, porque o `reset()` de um gauge sem rótulos do `prom-client` volta a 0, e isso diria "lag zero" exatamente quando a medida falhou.
+
+**DLQ:**
+- o gauge `requests_dlq` conta tudo o que está na DLQ, inclusive o que o SQS moveu pelo `maxReceiveCount`, que a app não vê;
+- `wagering_dead_lettered_total{code}` conta os envios explícitos do consumer, por motivo.
+
+`ApproximateNumberOfMessages` é aproximado na AWS real (no LocalStack é exato).
+
+### D45. O que conta como conflito de lock
+
+**Conflito = transação SQL que falhou por `55P03 lock_not_available` (timeout de D26) ou `40P01 deadlock`.**
+- **Onde conta:** uma vez por erro, no `MikroOrmTransactionRunner.run`. É um ponto só, que cobre HTTP, consumer, worker e o que vier.
+- **Contagem única:** a transação aninhada (savepoint, D29) propaga o mesmo erro para a externa, e um `WeakSet` de erros já contados evita contar duas vezes. **Verificado:** no teste do consumer, o aumento de conflitos é igual ao de retries `DEPENDENCY_UNAVAILABLE`.
+- **Contenção abaixo do timeout:** aparece no histograma `wagering_wallet_lock_wait_seconds`, medido no `findByIdForUpdate`.
+
+**Não contam:**
+- a corrida resolvida pela unique (é duplicata, em `wagering_duplicates_total`);
+- a linha pulada pelo `SKIP LOCKED` do publisher (é a divisão do trabalho);
+- a disputa na PK do inbox (é duplicata).
+
+**Correção encontrada pelo teste unitário:** `40P01` só era transitório quando o MikroORM o convertia em `DeadlockException`. As consultas Kysely (a reivindicação do outbox, a soma da reconciliação) entregam o erro cru do `pg`, então o código entrou em `isTransientDatabaseError`.
+
+### D46. `/metrics` aberto (P3)
+
+| Opção | Resultado |
+|---|---|
+| **Aberto como o health (escolhida)** | O Prometheus faz scrape sem credencial; o conteúdo é operacional (contagens, latências, profundidades), sem id, saldo nem dado de jogador. Fica fora do log automático de request, como `/health` |
+| Atrás do `AuthGuard` | Hoje o guard é no-op. Com autenticação real (seção 10), o scraper precisaria de um client e de um escopo próprios |
+| Porta separada | Um segundo servidor HTTP no processo |
+
+Em produção, a rota não sai pelo ingress público (rede interna ou allowlist). Quem alcança a porta vê volume e taxa de erro.
+
+### D47. Logs: campos por caminho e a regra de saldo (P2, P4, P8)
+
+**Campos da seção 12 por caminho** (`messageId` só existe no SQS):
+
+| Caminho | Campos |
+|---|---|
+| HTTP | `correlationId` sempre; `walletId`, `providerId` e `transactionId` quando a rota os tem. Vão via `PinoLogger.assign` nos controllers, com `assignResponse: true`, para que a linha `request completed` (ou `request errored`, nas respostas 5xx) e os logs do filtro de erros os levem |
+| Consumer | `correlationId`, `messageId`, `walletId` e `providerId` no contexto logo após o parse (retry e DLQ também os levam); `transactionId` no desfecho |
+| Publisher | Uma linha `info` por evento publicado (P8): `eventId`, `eventType`, `walletId`, `correlationId` do evento, `transactionId` e `providerId` lidos do envelope (nunca o `data` inteiro) e `delayMs`. Os mesmos campos na falha |
+| Worker | `correlationId` persistido (D39), `transactionId`, `walletId`, `providerId`, status e tentativas |
+| `PollingLoop` | O ciclo **e o log de erro do ciclo** rodam dentro do contexto do pino, com `worker` |
+
+**Regra única: saldos não entram em log** (ajuste da aprovação, P2).
+- **Chamadas de log:** nunca recebem `storedBalance`, `calculatedBalance`, `balanceBefore`/`After` nem o `money` de um payload. O log de divergência leva só `walletId`, `difference` e `checkedEntries`. A `difference` é a única quantia logada, porque mede o erro sem revelar o saldo. Os valores completos ficam na resposta do endpoint.
+- **Erros:** o serializer de `err` é allowlist (`type`, `message`, `code`, `constraint`, `stack`). Ele descarta `detail`, `where`, `parameters` e o resto que o `DriverException` copia do `pg`: o `detail` de um CHECK traz a linha inteira, e o dos triggers traz saldos.
+- **Mensagens e stacks de erro:** passam por uma máscara de valores monetários (`-?\b\d+\.\d{2}\b` → `[amount]`), porque as mensagens dos triggers de coerência e de algumas invariantes citam saldos. Ids, versões, horários e posições de código não casam com o padrão (teste unitário).
+- **Requisição e resposta:** continuam em allowlist (D5).
+- **`playerId`:** aparece só no `warn` de `WALLET_PLAYER_MISMATCH`, a trilha de auditoria da D28 (P4).
+
+**Armadilhas do nestjs-pino encontradas:**
+- **`assign` cria um logger filho, e o pino acrescenta os bindings em vez de substituí-los.** Atribuir a mesma chave duas vezes gerava `walletId` duplicado na linha. Cada campo agora é atribuído uma vez, os logs não repetem campos que já estão no contexto, e o teste acusa chave duplicada em qualquer linha.
+- **O nestjs-pino 5 mantém um único middleware pino-http por processo** (estado de módulo), criado pela primeira app. Em produção há uma app por processo, então não muda nada. Nos testes, todas as apps escrevem num destino comum (`testLogSink`, repassado ao stdout), a captura se inscreve nele, e o nível é ajustado em tempo de execução pelo `PinoLogger.root`, o ponto que a própria biblioteca expõe para isso. O reset de testes da biblioteca não é exportado pelo pacote.
+- `createApp(config, { logDestination })` é a costura no composition root; o logger continua sendo o real.
+
+**Teste com canários** (`test/integration/observability/logs.test.ts`): uma app com consumer, publisher e worker ligados, valores distintivos (saldo de abertura 4321.09, `amount` 987.65, `gameId` e `roundId` únicos) passando por HTTP, SQS, worker e publisher, mais um 503 por lock. O teste verifica:
+- os campos de cada caminho;
+- que nenhum canário aparece em nenhuma linha;
+- que nenhuma linha tem chave proibida (`money`, `amount`, `balance`, `payload`, `body`, `headers`, `playerId`, `detail`);
+- que nenhuma linha tem chave duplicada.
+
+## 10. Autenticação
 
 Fora do escopo implementado; a seção 2 do enunciado aceita essa decisão. O desenho que adotaríamos:
 - **IdP externo (Keycloak, OIDC).** Cada provedor de jogos é um client confidencial e obtém token via *client credentials*.
 - A API valida o JWT localmente (assinatura via JWKS em cache, `iss`, `aud`, `exp`). Um claim `provider_id` precisa ser igual ao `providerId` do corpo, senão a resposta é 403. Isso impede um provedor de submeter transações em nome de outro.
 - **Ponto de extensão no código:** `AuthGuard` no-op (`src/interfaces/http/auth/auth.guard.ts`), aplicado com `@UseGuards` no `WalletsController`, no `WageringController` e no `ProviderTransactionsController`. Um teste confere que ele está registrado. Os endpoints de health ficam abertos. A fila SQS é tratada como canal interno confiável, mas o `providerId` da mensagem passa pelas mesmas validações de domínio.
 
-## 10. Limitações conhecidas
+## 11. Limitações conhecidas
 
 - A LocalStack 4.14.0 está congelada e não recebe correções. Se a tag deixar de existir ou aparecer uma divergência de comportamento, a saída é o MiniStack (D1).
 - A aplicação ainda roda no host. O Dockerfile e o serviço `app` com réplicas entram na Etapa 6.
@@ -745,7 +898,11 @@ Fora do escopo implementado; a seção 2 do enunciado aceita essa decisão. O de
 - Mensagens com erro permanente vão para a DLQ com o motivo, mas o provedor não é avisado automaticamente (D30).
 - Um long polling abortado no shutdown pode atrasar mensagens por até a visibilidade da fila (30 s), sem perdê-las (D33).
 - O publisher mantém a transação aberta durante os envios ao SQS. O teto por ciclo é o timeout de cada envio vezes os eventos de uma wallet no lote (D36).
-- Um evento que falha sempre (por exemplo, maior que o limite de 256 KB do SQS) segura os seguintes da wallet indefinidamente, porque o outbox não tem limite de tentativas (D15). A métrica de outbox lag (Etapa 6) é o alarme.
+- Um evento que falha sempre (por exemplo, maior que o limite de 256 KB do SQS) segura os seguintes da wallet indefinidamente, porque o outbox não tem limite de tentativas (D15). A métrica de outbox lag (D44) é o alarme.
 - Duplicatas depois da janela de 5 min da FIFO chegam ao consumidor de eventos, que precisa deduplicar por `eventId` (D37).
 - A fila de eventos é ponto a ponto; mais de um consumidor pede SNS FIFO (D35).
 - Os eventos publicados ficam no outbox para sempre. O guard já permite apagar os publicados, mas não há job de retenção.
+- A reconciliação só roda sob demanda. Uma divergência só aparece quando alguém chama o endpoint; um job periódico varrendo as wallets fica para depois (P7).
+- Os gauges consultados no banco e no SQS saem repetidos em cada instância (agregar com `max`), e `ApproximateNumberOfMessages` é aproximado na AWS real (D44).
+- A máscara de valores nas mensagens de erro é heurística: pega quantias com 2 casas, que é o formato de todo `Money` do sistema, mas não um número inteiro solto (D47).
+- O nestjs-pino 5 tem um logger por processo; duas apps no mesmo processo compartilham destino e nível. Só os testes fazem isso (D47).

@@ -2,7 +2,7 @@
 
 Serviço financeiro distribuído que processa transações de apostas (BET, WIN, LOSS, REFUND, ROLLBACK) de múltiplos provedores, com idempotência persistente, ledger imutável e transactional outbox. O enunciado completo está em [`docs/DESAFIO.md`](docs/DESAFIO.md). As decisões técnicas e os trade-offs estão em [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
-**Status:** Etapas 1 a 5 concluídas: infra local, aplicação NestJS em Bun, config validada, logs JSON, health checks; o modelo de domínio (Money, Wallet, ledger, WagerTransaction, regras de BET/WIN/LOSS/REFUND/ROLLBACK, inbox, outbox e eventos); o schema PostgreSQL com as garantias no banco (constraints, índices e triggers), a persistência, os endpoints de wallet, a submissão de transações com idempotência, lock por wallet e outbox, testada com concorrência real; o consumer SQS com inbox, ack após o commit, backoff, DLQ e shutdown limpo; e o publisher do outbox (várias instâncias, ordem por wallet, retry) e o worker que resolve as transações em PENDING_REFERENCE.
+**Status:** Etapas 1 a 5 e 6a concluídas: infra local, aplicação NestJS em Bun, config validada, logs JSON, health checks; o modelo de domínio (Money, Wallet, ledger, WagerTransaction, regras de BET/WIN/LOSS/REFUND/ROLLBACK, inbox, outbox e eventos); o schema PostgreSQL com as garantias no banco (constraints, índices e triggers), a persistência, os endpoints de wallet, a submissão de transações com idempotência, lock por wallet e outbox, testada com concorrência real; o consumer SQS com inbox, ack após o commit, backoff, DLQ e shutdown limpo; o publisher do outbox (várias instâncias, ordem por wallet, retry) e o worker que resolve as transações em PENDING_REFERENCE; e a reconciliação de wallet, as métricas Prometheus e a revisão dos logs.
 
 ## Pré-requisitos
 
@@ -84,6 +84,14 @@ curl -s localhost:3000/providers/provider-a/wagering/transactions/transaction-12
 
 Status da submissão (ARCHITECTURE.md, D27): 200 PROCESSED, 202 PENDING_REFERENCE (referência ainda não chegou; o worker a resolve quando ela chegar, D38), 422 rejeição de negócio (`code` = `failureCode`), 409 conflito de idempotência, 400 payload inválido, 503 com `Retry-After` para falha transitória (reenviar a mesma requisição é seguro).
 
+```bash
+# reconciliação: saldo gravado × saldo reconstruído pelo ledger, numa leitura em snapshot que não bloqueia escritas
+curl -s -X POST localhost:3000/wallets/<walletId>/reconciliation
+# {"walletId":"…","storedBalance":{"amount":"975.00","currency":"BRL"},"calculatedBalance":{…},"difference":{"amount":"0.00",…},"consistent":true,"checkedEntries":42}
+```
+
+Uma divergência volta 200 com `consistent: false`, nunca é corrigida, gera um log `error` (só `walletId`, `difference` e `checkedEntries`) e conta em `wagering_reconciliations_total{result="inconsistent"}` (ARCHITECTURE.md, D42).
+
 O `amount` precisa ter exatamente 2 casas decimais (`"25.00"`). O ledger vem do lançamento mais recente para o mais antigo, e o cursor é opaco e estável mesmo com lançamentos novos chegando durante a paginação.
 
 ## Mensageria (SQS)
@@ -132,6 +140,27 @@ curl -s localhost:3000/providers/provider-a/wagering/transactions/refund-1
 
 Os eventos que o worker emite carregam o `correlationId` da requisição original (`refund-request-1`).
 
+## Métricas
+
+`GET /metrics` expõe as métricas no formato de texto do Prometheus, sem autenticação, como o health (ARCHITECTURE.md, D43 a D46). Todas as próprias começam com `wagering_`, e as de processo (`process_*`, `nodejs_*`) vêm junto.
+
+```bash
+curl -s localhost:3000/metrics | grep '^wagering_' | grep -v _bucket
+```
+
+| Pergunta | PromQL |
+|---|---|
+| Transações por status | `sum by (status) (rate(wagering_transactions_total[5m]))` |
+| Duplicatas detectadas | `sum by (type) (rate(wagering_duplicates_total[5m]))` |
+| Retries | `sum by (component, reason) (rate(wagering_retries_total[5m]))` |
+| Mensagens na DLQ | `max(wagering_sqs_queue_messages{queue="requests_dlq", state="visible"})` |
+| Conflitos de lock | `sum by (type) (rate(wagering_lock_conflicts_total[5m]))` |
+| Outbox lag | `max(wagering_outbox_oldest_pending_age_seconds)` |
+| Latência p95 por origem | `histogram_quantile(0.95, sum by (le, source) (rate(wagering_processing_duration_seconds_bucket[5m])))` |
+| Sonda do scrape falhando | `increase(wagering_metrics_probe_failures_total[5m]) > 0` |
+
+Com várias instâncias, some contadores e use `max` nos gauges, que são consultados no banco e no SQS e saem iguais em todas.
+
 ## Testes
 
 - **Unitários** (`test/unit`) não fazem I/O e não precisam da infra: domínio (`test/unit/domain`, incluindo regras de negócio, transições de status, hash de payload e um teste de propriedade do ledger com seed fixa), regra de dependência entre camadas (`test/unit/architecture`) e config.
@@ -140,6 +169,7 @@ Os eventos que o worker emite carregam o `correlationId` da requisição origina
 - **Sem paralelismo entre arquivos que limpam o banco.** O `bun test` roda os arquivos em série por padrão, e os scripts nunca passam `--parallel`. Além disso, todo arquivo de integração chama `useIntegrationEnvironment()` (`test/support/integration.ts`). Ela toma um advisory lock no Postgres (`pg_advisory_lock`) numa conexão dedicada durante o arquivo inteiro. Mesmo com `bun test --parallel`, os arquivos de integração esperam uns pelos outros em vez de mexer nos dados de outro teste.
 - Cada arquivo fecha a sua app Nest e as suas conexões no `afterAll`, porque os arquivos dividem o mesmo processo.
 - **Consumer SQS** (`test/integration/sqs`): cada teste cria um par de filas FIFO próprio, com visibilidade curta, e cobre redelivery, crash entre commit e ack, retry transitório, DLQ, ordem por grupo e shutdown.
+- **Reconciliação, métricas e logs** (`test/integration/http/reconciliation.test.ts`, `test/integration/application/reconcile-wallet.test.ts`, `test/integration/observability`): a divergência é provocada desligando os triggers só na transação do teste (`SET LOCAL session_replication_role = replica`, o usuário do container é superusuário) e restaurada no fim; um teste determinístico confirma uma BET entre as duas leituras da reconciliação para provar o snapshot; as métricas são conferidas pelo `/metrics` real; os logs são capturados de um destino comum aos testes e varridos atrás de valores-canário, chaves proibidas e chaves duplicadas.
 - **Publisher e worker** (`test/integration/workers`): cada teste do publisher usa uma fila de eventos própria e cobre dois publishers simultâneos (ordem por wallet, sem envio duplicado), instância morta antes de publicar, envio sem marcação absorvido pela deduplicação da FIFO, retry com backoff e evento em backoff segurando os seguintes da wallet. Os do worker cobrem REFUND antes da BET, ROLLBACK antes do WIN, o empurrão, novas tentativas, limite esgotado, replay, concorrência com o HTTP e dois workers.
 - **Concorrência** (`test/concurrency`): requisições HTTP em paralelo contra o Postgres real. O cliente reenvia ao receber 503, respeitando o `Retry-After`, e cada cenário registra quantos 503 recebeu (resumo no fim da execução). Depois de cada teste, todas as wallets são conferidas contra o ledger. O `.env.test` usa `DB_POOL_MAX=20` para haver paralelismo real no banco.
 - **Limpeza sem desligar triggers:** os arquivos que usam tabelas chamam `resetDatabase()`, que derruba e recria o schema (`DROP SCHEMA` + migrations) dentro do lock. O ledger é imutável e nem os testes apagam linhas dele. O reset recusa bancos cujo nome não termine em `_test`.
@@ -176,7 +206,7 @@ Toda a configuração vem de variáveis de ambiente, validadas na subida. Com al
 | `REFERENCE_WORKER_BATCH` | 50 | Transações avaliadas por ciclo |
 | `WORKER_SHUTDOWN_GRACE_MS` | 10000 | Tempo para o publisher e o worker concluírem o ciclo no SIGTERM |
 | `DB_LOCK_TIMEOUT_MS` | 2000 | Espera máxima pelo lock de uma wallet; além disso, 503 retryable |
-| `HEALTH_CHECK_TIMEOUT_MS` | 1000 | Timeout de cada dependência no `/health/ready` |
+| `HEALTH_CHECK_TIMEOUT_MS` | 1000 | Timeout de cada dependência no `/health/ready` e de cada sonda do `/metrics` |
 
 ## Solução de problemas
 

@@ -1,5 +1,10 @@
 name: wagering-processor
 
+x-app-network-environment: &app-network-environment
+  DB_HOST: postgres
+  DB_PORT: "5432"
+  SQS_ENDPOINT: http://sqs:4566
+
 services:
   postgres:
     image: postgres:18.6-alpine
@@ -38,6 +43,45 @@ services:
       timeout: 5s
       retries: 60
       start_period: 5s
+
+  migrate:
+    build: .
+    image: wagering-processor:local
+    profiles: ["app"]
+    command: ["bun", "src/migrate.ts"]
+    env_file: .env
+    environment: *app-network-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  app:
+    build: .
+    image: wagering-processor:local
+    profiles: ["app"]
+    env_file: .env
+    environment:
+      <<: *app-network-environment
+      HTTP_PORT: "3000"
+    deploy:
+      replicas: ${APP_REPLICAS:-3}
+    ports:
+      - "${APP_PORTS:-3001-3003}:3000"
+    init: true
+    stop_grace_period: 25s
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/health/ready > /dev/null || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      sqs:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
 volumes:
   postgres-data:

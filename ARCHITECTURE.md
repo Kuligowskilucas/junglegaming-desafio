@@ -430,21 +430,102 @@ Todo erro sai como `application/problem+json`, gerado pelo filtro global `Proble
 | Banco inalcançável, deadlock, lock timeout, falha de serialização | 503 + `Retry-After: 1` | `DEPENDENCY_UNAVAILABLE` | true |
 | Erro inesperado ou de invariante | 500 | `INTERNAL_ERROR` | false |
 
-Reservado para a Etapa 4, na mesma convenção: 400 `INVALID_WAGER_TRANSACTION` (+ `reason`) e `MISSING_IDEMPOTENCY_KEY`; 409 `IDEMPOTENCY_CONFLICT`; 422 para rejeição de negócio (com o resultado da transação e o `failureCode`); 202 para PENDING_REFERENCE.
+Os códigos da submissão de transações (409 de idempotência, 422 de rejeição, 202 de pendência) estão em D27.
 
 O `/health/ready` define o 503 por `@Res({ passthrough: true })` e não passa pelo filtro, mantendo o formato próprio de D6.
 
-## 6. Autenticação
+## 6. Submissão de transações
+
+Etapa 4: o caso de uso `SubmitWagerTransaction` (`src/application/wagering`), reutilizável pela entrada HTTP e, na Etapa 5, pelo consumer SQS; `POST /wagering/transactions` e os dois GETs.
+
+### D24. Sequência transacional
+
+**Antes da transação SQL:**
+1. `Money.from` + `WagerTransaction.create`: valida o payload (400) e calcula o `payloadHash`.
+2. Busca rápida de idempotência, sem lock, por `(provider_id, idempotency_key)`. Se acha → replay ou 409. Assim, replays não disputam a wallet.
+
+**Dentro de `em.transactional()` (READ COMMITTED):**
+
+3. `findByIdForUpdate(walletId)` → `SELECT … FOR UPDATE` (`LockMode.PESSIMISTIC_WRITE`, `refresh: true`). Wallet inexistente → 404.
+4. **Revalida a idempotência sob o lock.**
+5. Dono da wallet (D28).
+6. Resolve a referência por `(provider_id, reference_external_transaction_id)`.
+7. `referenceAlreadyReversed` = existe REFUND ou ROLLBACK **PROCESSED** com `reference_transaction_id = referência` (`em.count`, servido pelo índice parcial `wager_transactions_one_reversal_per_reference`).
+8. `settleWagerTransaction` (domínio).
+9. Grava a transação → lançamento e wallet (se houve movimento) → outbox (`WagerTransactionProcessed`, `WalletBalanceChanged`, `WagerTransactionRejected` ou `WagerTransactionPendingReference`, com `correlationId` e `causationId`).
+10. COMMIT, quando os triggers deferidos (D17) conferem a coerência.
+
+**Por que a ordem é correta com várias requisições simultâneas:**
+- O lock vem antes de toda leitura que decide o resultado, e toda escrita que mudaria esses fatos também exige o lock da mesma wallet:
+  - payload igual implica `walletId` igual;
+  - uma reversão PROCESSED da referência R só existe com a wallet de R travada, porque `checkReference` rejeita outra wallet e rejeição não grava reversão;
+  - o saldo só muda com a wallet travada.
+- Sob READ COMMITTED, cada comando lê o que já foi confirmado quando ele começa. A revalidação do passo 4 roda depois que o lock foi concedido, ou seja, depois do COMMIT de quem o segurava, então ela enxerga a transação concorrente.
+- O `SELECT … FOR UPDATE` relê a versão mais recente da linha após a espera, então o saldo usado no settlement nunca é antigo (sem lost update).
+- A busca do passo 2 é só um atalho: se erra para "não existe", o passo 4 corrige; se acha, a linha é confirmada e imutável.
+- O instante do settlement nunca é anterior ao `createdAt` do candidato (`max(agora, createdAt)`), para que um ajuste de relógio não viole `updated_at >= created_at`.
+
+### D25. Idempotência, replay e a unique como rede de segurança
+
+- **Requisições idênticas simultâneas:** a segunda espera o lock, e a revalidação do passo 4 encontra a primeira → **replay** (`idempotentReplay: true`, mesmo `transactionId` e mesmo saldo). Elas não chegam a disputar a unique. Verificado com 50 envios paralelos: 1 processamento, 49 replays, 1 débito.
+- **Rede de segurança:** o repositório traduz a violação de `wager_transactions_idempotency_key` e `wager_transactions_external_id_key` em `DuplicateWagerTransactionError`. O caso de uso deixa a transação SQL (abortada) fazer rollback e, fora dela, relê a linha vencedora: mesma key e mesmo hash → replay; hash diferente → 409 `IDEMPOTENCY_CONFLICT`; mesmo id externo com outra key → 409 `DUPLICATE_EXTERNAL_TRANSACTION_ID`. **Nunca 500.**
+  - Esse caminho acontece de verdade quando a mesma key chega com payloads de wallets diferentes, que travam wallets diferentes e só se encontram na unique. O teste de concorrência cobre isso, mas cada rodada pode cair na revalidação ou na unique.
+  - Para provar o caminho da unique de forma determinística, `test/integration/application/submit-wager-transaction.test.ts` usa uma subclasse do repositório real que "não enxerga" a linha nas duas primeiras buscas: o INSERT esbarra na unique do Postgres e o resultado é replay (ou 409), com o saldo intacto.
+- **Uma violação de `wager_transactions_one_reversal_per_reference` não é traduzida.** Sob o lock ela é impossível; se ocorrer, é bug (500 no log), e o índice já impediu o crédito duplo. Verificado com REFUND e ROLLBACK da mesma BET em paralelo, 10 rodadas: sempre um PROCESSED e um `REFERENCE_ALREADY_REVERSED`.
+- **Replay devolve o resultado original:** a linha de `wager_transactions` é o registro de idempotência. O `observed_balance` gravado no desfecho é imutável, então o replay mostra o saldo daquele momento mesmo que a wallet tenha mudado. Uma transação que ainda espera referência é devolvida no estado atual (P4): se o worker da Etapa 5 a resolver, o replay já mostra o desfecho final.
+
+### D26. Lock timeout
+
+`DB_LOCK_TIMEOUT_MS` (padrão 2000) vai para todas as conexões do pool como `driverOptions.options = '-c lock_timeout=<ms>'`, sem SQL cru. Esperar mais que isso pelo lock de uma wallet dá `55P03 lock_not_available`. Como o MikroORM não converte esse código, ele foi incluído em `isTransientDatabaseError`, e o filtro responde **503 `DEPENDENCY_UNAVAILABLE`, `retryable: true`, `Retry-After: 1`**. Nada é gravado, então reenviar a mesma requisição é seguro. Por que 2 s: cada transação segura o lock por milissegundos, então 2 s de espera já indicam saturação, e um 503 explícito é melhor que esgotar o pool. Testado com uma sessão segurando `FOR UPDATE` e a app com 300 ms: 503; depois de soltar o lock, o reenvio processa.
+
+**Nos testes de concorrência, o cliente reenvia automaticamente ao receber 503, respeitando o `Retry-After`**, como um provedor faria. Os resultados esperados continuam exatos porque o reenvio é idempotente. Cada cenário registra quantos 503 recebeu, e o resumo sai no fim da execução. Nas execuções desta etapa (pool de 20, lock timeout de 2 s), **todos os cenários tiveram 0 reenvios**: seção 8, mesma aposta 50×, wallet quente com 120 BETs, 10 wallets × 20 BETs, REFUND × ROLLBACK, mesma key em wallets diferentes e mesmo id externo com keys diferentes. A suíte rodou 5 vezes seguidas sem falha.
+
+### D27. Contrato de status da submissão
+
+O status HTTP depende só do status da transação e é igual no replay (P1):
+
+| Desfecho | HTTP | Corpo |
+|---|---|---|
+| PROCESSED | 200 | `{ transactionId, status, balance, idempotentReplay }` |
+| PENDING_REFERENCE | 202 | o mesmo, com `balance: null` (P3) |
+| REJECTED | 422 `application/problem+json` | `code` = `failureCode` + extensões `transactionId`, `transactionStatus`, `failureCode`, `balance` e `idempotentReplay` (P2) |
+| Mesma key, outro payload | 409 | `IDEMPOTENCY_CONFLICT` + `transactionId` existente |
+| Mesmo id externo, outra key | 409 | `DUPLICATE_EXTERNAL_TRANSACTION_ID` + `transactionId` existente (P7) |
+| Jogador não é dono da wallet | 422 | `WALLET_PLAYER_MISMATCH`, sem persistir (D28) |
+| Wallet inexistente | 404 | `WALLET_NOT_FOUND`, sem persistir |
+| Sem `Idempotency-Key` / key inválida | 400 | `MISSING_IDEMPOTENCY_KEY` / `VALIDATION_FAILED` (P9: 1–255 ASCII imprimíveis, sem espaço) |
+| Payload inválido | 400 | `VALIDATION_FAILED`, `INVALID_MONEY` ou `INVALID_WAGER_TRANSACTION` (o `kind` é validado pelo domínio, P10) |
+| Lock timeout ou banco fora | 503 + `Retry-After` | `DEPENDENCY_UNAVAILABLE`, `retryable: true` |
+
+Toda resposta de transação leva `Location: /wagering/transactions/:id`. No 422, o status da transação vai em `transactionStatus`, porque `status` é o código HTTP pela RFC 9457; o `problemDetails` garante que os campos padrão nunca são sobrescritos por extensões. `GET /wagering/transactions/:id` e `GET /providers/:providerId/wagering/transactions/:externalTransactionId` devolvem a visão completa; inexistente → 404 `TRANSACTION_NOT_FOUND`.
+
+### D28. Erros não persistidos e dependentes em PENDING_REFERENCE
+
+**`WALLET_PLAYER_MISMATCH` (pendência da E2): 422 sem persistir (P5).**
+
+| Opção | Resultado |
+|---|---|
+| **422 sem persistir (escolhida)** | Não expõe nada da wallet alheia; determinístico (o reenvio dá o mesmo 422); auditável pelo log `warn` com `walletId` e `playerId` |
+| Persistir como REJECTED | O `observed_balance` obrigatório exporia o saldo de **outra** wallet no replay e no evento |
+| 404 | Esconderia o erro real do provedor |
+
+**Dependentes em PENDING_REFERENCE (P6):** não são processadas no mesmo pedido da referência. Isso alongaria a transação, encadearia efeitos e faria uma falha da dependente derrubar a referência. Ficam com o worker da Etapa 5, que pode ganhar um "empurrão": ao processar uma referência, reagendar para agora as dependentes que esperam por ela, com um índice parcial `(provider_id, reference_external_transaction_id) WHERE status = 'PENDING_REFERENCE'`.
+
+**Pendência para a Etapa 5: erros não persistidos não geram evento.** `WALLET_PLAYER_MISMATCH`, wallet inexistente e payload inválido (`VALIDATION_FAILED`, `INVALID_MONEY`, `INVALID_WAGER_TRANSACTION`) não criam linha em `wager_transactions` nem evento no outbox. Pelo HTTP, o provedor recebe o 4xx. **Pelo SQS, onde não há resposta, o provedor não ficaria sabendo.** A Etapa 5 precisa decidir o destino deles, por exemplo DLQ como erro permanente, com o motivo nos atributos da mensagem, e/ou um evento próprio de rejeição de entrada.
+
+## 7. Autenticação
 
 Fora do escopo implementado; a seção 2 do enunciado aceita essa decisão. O desenho que adotaríamos:
 - **IdP externo (Keycloak, OIDC).** Cada provedor de jogos é um client confidencial e obtém token via *client credentials*.
 - A API valida o JWT localmente (assinatura via JWKS em cache, `iss`, `aud`, `exp`). Um claim `provider_id` precisa ser igual ao `providerId` do corpo, senão a resposta é 403. Isso impede um provedor de submeter transações em nome de outro.
-- **Ponto de extensão no código:** `AuthGuard` no-op (`src/interfaces/http/auth/auth.guard.ts`), aplicado com `@UseGuards` no `WalletsController` e, na Etapa 4, nos controllers de wagering. Um teste confere que ele está registrado. Os endpoints de health ficam abertos. A fila SQS é tratada como canal interno confiável, mas o `providerId` da mensagem passa pelas mesmas validações de domínio.
+- **Ponto de extensão no código:** `AuthGuard` no-op (`src/interfaces/http/auth/auth.guard.ts`), aplicado com `@UseGuards` no `WalletsController`, no `WageringController` e no `ProviderTransactionsController`. Um teste confere que ele está registrado. Os endpoints de health ficam abertos. A fila SQS é tratada como canal interno confiável, mas o `providerId` da mensagem passa pelas mesmas validações de domínio.
 
-## 7. Limitações conhecidas
+## 8. Limitações conhecidas
 
 - A LocalStack 4.14.0 está congelada e não recebe correções. Se a tag deixar de existir ou aparecer uma divergência de comportamento, a saída é o MiniStack (D1).
 - A aplicação ainda roda no host. O Dockerfile e o serviço `app` com réplicas entram na Etapa 5 ou 6.
 - Sem TLS entre a aplicação e as dependências locais (ambiente de desenvolvimento).
 - A app conecta como dono das tabelas. A imutabilidade não depende disso (triggers valem para todos), mas um role com privilégios mínimos seria a defesa em profundidade em produção (D20).
 - O `correlationId` não aparece no problem de JSON malformado, porque o parser de corpo roda antes do middleware de log que atribui o id.
+- Transações em PENDING_REFERENCE só são reavaliadas pelo worker da Etapa 5; até lá, ficam pendentes mesmo depois que a referência chega (D28).
+- Erros de entrada não persistidos não geram evento; pelo SQS isso precisa de destino próprio (pendência da Etapa 5, D28).

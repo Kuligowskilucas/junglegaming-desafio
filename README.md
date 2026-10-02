@@ -2,7 +2,7 @@
 
 Serviço financeiro distribuído que processa transações de apostas (BET, WIN, LOSS, REFUND, ROLLBACK) de múltiplos provedores, com idempotência persistente, ledger imutável e transactional outbox. O enunciado completo está em [`docs/DESAFIO.md`](docs/DESAFIO.md). As decisões técnicas e os trade-offs estão em [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
-**Status:** Etapas 1 a 3 concluídas: infra local, aplicação NestJS em Bun, config validada, logs JSON, health checks; o modelo de domínio (Money, Wallet, ledger, WagerTransaction, regras de BET/WIN/LOSS/REFUND/ROLLBACK, inbox, outbox e eventos); e o schema PostgreSQL com as garantias no banco (constraints, índices e triggers), a persistência e os endpoints de wallet.
+**Status:** Etapas 1 a 4 concluídas: infra local, aplicação NestJS em Bun, config validada, logs JSON, health checks; o modelo de domínio (Money, Wallet, ledger, WagerTransaction, regras de BET/WIN/LOSS/REFUND/ROLLBACK, inbox, outbox e eventos); o schema PostgreSQL com as garantias no banco (constraints, índices e triggers), a persistência, os endpoints de wallet e a submissão de transações com idempotência, lock por wallet e outbox, testada com concorrência real.
 
 ## Pré-requisitos
 
@@ -49,6 +49,7 @@ docker compose exec sqs sh -c 'awslocal sqs get-queue-attributes --attribute-nam
 | `bun test` | Todos os testes (unitários e de integração) |
 | `bun run test:unit` | Só os testes sem I/O (domínio, arquitetura, config) |
 | `bun run test:integration` | Só os testes contra Postgres e SQS reais |
+| `bun run test:concurrency` | Só os cenários com paralelismo real (seção 8, mesma aposta 50×, wallet quente, reversões simultâneas) |
 | `bun run db:migrate` | Aplica as migrations pendentes (6: wallets, transações, ledger, coerência, inbox, outbox) |
 | `bun run db:migrate:down` | Reverte a última migration |
 | `bun run db:migration:create` | Cria uma migration em branco (SQL escrito à mão) |
@@ -71,6 +72,18 @@ curl -s 'localhost:3000/wallets/<walletId>/ledger?limit=50'                 # { 
 curl -s 'localhost:3000/wallets/<walletId>/ledger?limit=50&cursor=<nextCursor>'
 ```
 
+```bash
+# submeter uma transação: Idempotency-Key obrigatório; mesma key e mesmo payload → replay (idempotentReplay: true)
+curl -si -X POST localhost:3000/wagering/transactions -H 'content-type: application/json' \
+  -H 'Idempotency-Key: provider-a:transaction-123' \
+  -d '{"providerId":"provider-a","externalTransactionId":"transaction-123","playerId":"<playerId>","walletId":"<walletId>","roundId":"round-987","gameId":"fortune-chimp","kind":"BET","money":{"amount":"25.00","currency":"BRL"}}'
+
+curl -s localhost:3000/wagering/transactions/<transactionId>
+curl -s localhost:3000/providers/provider-a/wagering/transactions/transaction-123
+```
+
+Status da submissão (ARCHITECTURE.md, D27): 200 PROCESSED, 202 PENDING_REFERENCE (referência ainda não chegou), 422 rejeição de negócio (`code` = `failureCode`), 409 conflito de idempotência, 400 payload inválido, 503 com `Retry-After` para falha transitória (reenviar a mesma requisição é seguro).
+
 O `amount` precisa ter exatamente 2 casas decimais (`"25.00"`). O ledger vem do lançamento mais recente para o mais antigo, e o cursor é opaco e estável mesmo com lançamentos novos chegando durante a paginação.
 
 ## Testes
@@ -80,6 +93,7 @@ O `amount` precisa ter exatamente 2 casas decimais (`"25.00"`). O ledger vem do 
 - O `bun test` define `NODE_ENV=test` e carrega o `.env.test` por cima do `.env`. Os testes usam o banco **`wagering_test`**, criado pelo init do Postgres, e não tocam no banco de desenvolvimento.
 - **Sem paralelismo entre arquivos que limpam o banco.** O `bun test` roda os arquivos em série por padrão, e os scripts nunca passam `--parallel`. Além disso, todo arquivo de integração chama `useIntegrationEnvironment()` (`test/support/integration.ts`). Ela toma um advisory lock no Postgres (`pg_advisory_lock`) numa conexão dedicada durante o arquivo inteiro. Mesmo com `bun test --parallel`, os arquivos de integração esperam uns pelos outros em vez de mexer nos dados de outro teste.
 - Cada arquivo fecha a sua app Nest e as suas conexões no `afterAll`, porque os arquivos dividem o mesmo processo.
+- **Concorrência** (`test/concurrency`): requisições HTTP em paralelo contra o Postgres real. O cliente reenvia ao receber 503, respeitando o `Retry-After`, e cada cenário registra quantos 503 recebeu (resumo no fim da execução). Depois de cada teste, todas as wallets são conferidas contra o ledger. O `.env.test` usa `DB_POOL_MAX=20` para haver paralelismo real no banco.
 - **Limpeza sem desligar triggers:** os arquivos que usam tabelas chamam `resetDatabase()`, que derruba e recria o schema (`DROP SCHEMA` + migrations) dentro do lock. O ledger é imutável e nem os testes apagam linhas dele. O reset recusa bancos cujo nome não termine em `_test`.
 
 ## Configuração
@@ -97,6 +111,7 @@ Toda a configuração vem de variáveis de ambiente, validadas na subida. Com al
 | `SQS_ENDPOINT` | — | Endpoint do emulador; sem ele, o SDK usa a AWS real |
 | `SQS_WAGER_QUEUE_NAME`, `SQS_WAGER_DLQ_NAME` | — | Nomes das filas FIFO (precisam terminar em `.fifo`) |
 | `SQS_MAX_RECEIVE_COUNT` | 5 | Entregas antes de a mensagem ir para a DLQ (usado na criação da fila) |
+| `DB_LOCK_TIMEOUT_MS` | 2000 | Espera máxima pelo lock de uma wallet; além disso, 503 retryable |
 | `HEALTH_CHECK_TIMEOUT_MS` | 1000 | Timeout de cada dependência no `/health/ready` |
 
 ## Solução de problemas

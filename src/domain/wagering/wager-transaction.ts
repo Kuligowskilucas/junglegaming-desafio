@@ -18,6 +18,7 @@ export const referenceRetryPolicy: BackoffPolicy & { readonly maxAttempts: numbe
 export interface CreateWagerTransactionProps extends WagerPayload {
   id: string;
   idempotencyKey: string;
+  correlationId: string;
   createdAt: Date;
 }
 
@@ -26,6 +27,7 @@ export interface OpeningTransactionProps {
   walletId: string;
   playerId: string;
   money: Money;
+  correlationId: string;
   at: Date;
 }
 
@@ -34,6 +36,7 @@ export interface WagerTransactionState {
   providerId: string;
   externalTransactionId: string;
   idempotencyKey: string;
+  correlationId: string;
   payloadHash: string;
   walletId: string;
   playerId: string;
@@ -114,6 +117,7 @@ export class WagerTransaction {
   readonly providerId: string;
   readonly externalTransactionId: string;
   readonly idempotencyKey: string;
+  readonly correlationId: string;
   readonly payloadHash: string;
   readonly walletId: string;
   readonly playerId: string;
@@ -137,6 +141,7 @@ export class WagerTransaction {
     this.providerId = state.providerId;
     this.externalTransactionId = state.externalTransactionId;
     this.idempotencyKey = state.idempotencyKey;
+    this.correlationId = state.correlationId;
     this.payloadHash = state.payloadHash;
     this.walletId = state.walletId;
     this.playerId = state.playerId;
@@ -163,6 +168,7 @@ export class WagerTransaction {
       providerId: props.providerId,
       externalTransactionId: props.externalTransactionId,
       idempotencyKey: props.idempotencyKey,
+      correlationId: props.correlationId,
       payloadHash: hashWagerPayload(props),
       walletId: props.walletId,
       playerId: props.playerId,
@@ -201,6 +207,7 @@ export class WagerTransaction {
       ...payload,
       id: props.id,
       idempotencyKey: `${internalProviderId}:opening:${props.walletId}`,
+      correlationId: props.correlationId,
       payloadHash: hashWagerPayload(payload),
       referenceExternalTransactionId: undefined,
       status: WagerTransactionStatus.Processed,
@@ -376,6 +383,7 @@ export class WagerTransaction {
       providerId: props.providerId,
       externalTransactionId: props.externalTransactionId,
       idempotencyKey: props.idempotencyKey,
+      correlationId: props.correlationId,
       playerId: props.playerId,
       walletId: props.walletId,
       roundId: props.roundId,

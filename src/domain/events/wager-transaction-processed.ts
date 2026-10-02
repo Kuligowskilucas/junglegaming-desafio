@@ -24,6 +24,7 @@ export class WagerTransactionProcessed extends IntegrationEvent<WagerTransaction
     return new WagerTransactionProcessed({
       ...context,
       aggregateId: transaction.id,
+      orderingKey: transaction.walletId,
       data: {
         ...wagerTransactionEventData(transaction),
         ...(referenceTransactionId === undefined ? {} : { referenceTransactionId }),

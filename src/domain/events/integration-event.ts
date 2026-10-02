@@ -3,6 +3,7 @@ import { deepFreeze } from "../shared/deep-freeze";
 export interface IntegrationEventProps<T> {
   eventId: string;
   aggregateId: string;
+  orderingKey: string;
   correlationId: string;
   causationId?: string | undefined;
   occurredAt: Date;
@@ -26,6 +27,7 @@ export abstract class IntegrationEvent<T> {
 
   readonly eventId: string;
   readonly aggregateId: string;
+  readonly orderingKey: string;
   readonly correlationId: string;
   readonly causationId: string | undefined;
   readonly data: Readonly<T>;
@@ -34,6 +36,7 @@ export abstract class IntegrationEvent<T> {
   protected constructor(props: IntegrationEventProps<T>) {
     this.eventId = props.eventId;
     this.aggregateId = props.aggregateId;
+    this.orderingKey = props.orderingKey;
     this.correlationId = props.correlationId;
     this.causationId = props.causationId;
     this.occurredAtTime = props.occurredAt.getTime();

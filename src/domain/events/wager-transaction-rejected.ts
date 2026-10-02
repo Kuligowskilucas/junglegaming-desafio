@@ -25,6 +25,7 @@ export class WagerTransactionRejected extends IntegrationEvent<WagerTransactionR
     return new WagerTransactionRejected({
       ...context,
       aggregateId: transaction.id,
+      orderingKey: transaction.walletId,
       data: {
         ...wagerTransactionEventData(transaction),
         failureCode,

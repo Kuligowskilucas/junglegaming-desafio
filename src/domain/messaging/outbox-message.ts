@@ -11,6 +11,8 @@ export const outboxRetryPolicy: BackoffPolicy = {
 export interface OutboxMessageState {
   id: string;
   aggregateId: string;
+  orderingKey: string;
+  position: number | undefined;
   eventType: string;
   payload: Readonly<Record<string, unknown>>;
   occurredAt: Date;
@@ -28,6 +30,8 @@ export class InvalidOutboxStateError extends InvariantViolationError {
 export class OutboxMessage {
   readonly id: string;
   readonly aggregateId: string;
+  readonly orderingKey: string;
+  readonly position: number | undefined;
   readonly eventType: string;
   readonly payload: Readonly<Record<string, unknown>>;
   private readonly occurredAtTime: number;
@@ -38,6 +42,8 @@ export class OutboxMessage {
   private constructor(state: OutboxMessageState) {
     this.id = state.id;
     this.aggregateId = state.aggregateId;
+    this.orderingKey = state.orderingKey;
+    this.position = state.position;
     this.eventType = state.eventType;
     this.payload = deepFreeze(state.payload);
     this.occurredAtTime = state.occurredAt.getTime();
@@ -50,6 +56,8 @@ export class OutboxMessage {
     return new OutboxMessage({
       id: event.eventId,
       aggregateId: event.aggregateId,
+      orderingKey: event.orderingKey,
+      position: undefined,
       eventType: event.eventType,
       payload: event.toJSON(),
       occurredAt: event.occurredAt,

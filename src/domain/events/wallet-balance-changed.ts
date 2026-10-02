@@ -27,6 +27,7 @@ export class WalletBalanceChanged extends IntegrationEvent<WalletBalanceChangedD
     return new WalletBalanceChanged({
       ...context,
       aggregateId: wallet.id,
+      orderingKey: wallet.id,
       data: {
         walletId: wallet.id,
         transactionId: entry.transactionId,

@@ -27,6 +27,7 @@ export class WagerTransactionPendingReference extends IntegrationEvent<WagerTran
     return new WagerTransactionPendingReference({
       ...context,
       aggregateId: transaction.id,
+      orderingKey: transaction.walletId,
       data: {
         ...wagerTransactionEventData(transaction),
         referenceExternalTransactionId,

@@ -2,6 +2,7 @@ import { join } from "node:path";
 import { Migrator } from "@mikro-orm/migrations";
 import { defineConfig } from "@mikro-orm/postgresql";
 import type { AppConfig } from "../config/app-config";
+import { persistenceRecords } from "./records";
 
 const migrationsPath = join(import.meta.dirname, "migrations");
 
@@ -13,8 +14,7 @@ export function createMikroOrmOptions(config: AppConfig) {
     password: config.database.password,
     dbName: config.database.name,
     pool: { max: config.database.poolMax },
-    entities: [],
-    discovery: { warnWhenNoEntities: false },
+    entities: persistenceRecords,
     extensions: [Migrator],
     migrations: {
       path: migrationsPath,

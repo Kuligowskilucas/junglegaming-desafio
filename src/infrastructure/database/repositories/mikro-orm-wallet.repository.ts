@@ -4,13 +4,17 @@ import { Injectable } from "@nestjs/common";
 import { WalletAlreadyExistsError } from "../../../application/errors";
 import { WalletRepository } from "../../../application/ports/wallet-repository";
 import type { Wallet } from "../../../domain/wallet/wallet";
+import { WageringMetrics } from "../../observability/wagering-metrics";
 import { isUniqueViolationOf } from "../constraint-violation";
 import { walletMapper } from "../mappers/wallet.mapper";
 import { WalletRecord } from "../records/wallet.record";
 
 @Injectable()
 export class MikroOrmWalletRepository extends WalletRepository {
-  constructor(private readonly em: EntityManager) {
+  constructor(
+    private readonly em: EntityManager,
+    private readonly metrics: WageringMetrics,
+  ) {
     super();
   }
 
@@ -26,17 +30,22 @@ export class MikroOrmWalletRepository extends WalletRepository {
   }
 
   async findById(walletId: string): Promise<Wallet | undefined> {
-    const record = await this.em.findOne(WalletRecord, { id: walletId });
+    const record = await this.em.findOne(WalletRecord, { id: walletId }, { refresh: true });
     return record ? walletMapper.toDomain(record) : undefined;
   }
 
   async findByIdForUpdate(walletId: string): Promise<Wallet | undefined> {
-    const record = await this.em.findOne(
-      WalletRecord,
-      { id: walletId },
-      { lockMode: LockMode.PESSIMISTIC_WRITE, refresh: true },
-    );
-    return record ? walletMapper.toDomain(record) : undefined;
+    const startedAt = performance.now();
+    try {
+      const record = await this.em.findOne(
+        WalletRecord,
+        { id: walletId },
+        { lockMode: LockMode.PESSIMISTIC_WRITE, refresh: true },
+      );
+      return record ? walletMapper.toDomain(record) : undefined;
+    } finally {
+      this.metrics.walletLockWaited((performance.now() - startedAt) / 1_000);
+    }
   }
 
   async update(wallet: Wallet): Promise<void> {

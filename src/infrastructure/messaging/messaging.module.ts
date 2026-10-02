@@ -5,6 +5,7 @@ import { EventPublisher } from "../../application/ports/event-publisher";
 import { QueueUrlResolver } from "./queue-url-resolver";
 import { SqsEventPublisher } from "./sqs-event-publisher";
 import { SqsHealth } from "./sqs-health";
+import { SqsQueueDepthProbe } from "./sqs-queue-depth.probe";
 import { SqsQueueGateway } from "./sqs-queue-gateway";
 
 @Module({
@@ -17,10 +18,11 @@ import { SqsQueueGateway } from "./sqs-queue-gateway";
     },
     QueueUrlResolver,
     SqsHealth,
+    SqsQueueDepthProbe,
     SqsQueueGateway,
     { provide: EventPublisher, useClass: SqsEventPublisher },
   ],
-  exports: [SQSClient, QueueUrlResolver, SqsHealth, SqsQueueGateway, EventPublisher],
+  exports: [SQSClient, QueueUrlResolver, SqsHealth, SqsQueueDepthProbe, SqsQueueGateway, EventPublisher],
 })
 export class MessagingModule implements OnApplicationShutdown {
   constructor(private readonly client: SQSClient) {}

@@ -39,7 +39,7 @@ export class ProblemDetailsFilter implements ExceptionFilter {
     }
     if (exception instanceof WalletPlayerMismatchError) {
       this.logger.warn(
-        { walletId: exception.walletId, playerId: exception.playerId, code: problem.code },
+        { playerId: exception.playerId, code: problem.code },
         "Wager transaction refused: the player does not own the wallet",
       );
     }

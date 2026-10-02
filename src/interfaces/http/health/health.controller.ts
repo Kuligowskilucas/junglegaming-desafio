@@ -2,6 +2,7 @@ import { Controller, Get, Logger, Res } from "@nestjs/common";
 import { AppConfig } from "../../../infrastructure/config/app-config";
 import { DatabaseHealth } from "../../../infrastructure/database/database-health";
 import { SqsHealth } from "../../../infrastructure/messaging/sqs-health";
+import { rejectWhenAborted } from "../../../infrastructure/observability/abortable";
 
 type DependencyStatus = { status: "up" } | { status: "down"; reason: "timeout" | "unavailable" };
 
@@ -50,10 +51,4 @@ export class HealthController {
       return { status: "down", reason };
     }
   }
-}
-
-function rejectWhenAborted(signal: AbortSignal): Promise<never> {
-  return new Promise((_, reject) => {
-    signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-  });
 }

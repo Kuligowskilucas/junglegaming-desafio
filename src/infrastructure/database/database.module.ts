@@ -2,6 +2,7 @@ import { MikroOrmModule } from "@mikro-orm/nestjs";
 import { PostgreSqlDriver } from "@mikro-orm/postgresql";
 import { Module } from "@nestjs/common";
 import { AppConfig } from "../config/app-config";
+import { BacklogProbe } from "./backlog.probe";
 import { DatabaseHealth } from "./database-health";
 import { createMikroOrmOptions } from "./mikro-orm.options";
 
@@ -13,7 +14,7 @@ import { createMikroOrmOptions } from "./mikro-orm.options";
       useFactory: (config: AppConfig) => createMikroOrmOptions(config),
     }),
   ],
-  providers: [DatabaseHealth],
-  exports: [DatabaseHealth],
+  providers: [DatabaseHealth, BacklogProbe],
+  exports: [DatabaseHealth, BacklogProbe],
 })
 export class DatabaseModule {}

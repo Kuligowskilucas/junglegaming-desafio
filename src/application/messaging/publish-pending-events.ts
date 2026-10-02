@@ -5,14 +5,13 @@ import type { OutboxClaimLimits, OutboxRepository } from "../ports/outbox-reposi
 import type { TransactionRunner } from "../ports/transaction-runner";
 
 export interface PublicationFailure {
-  eventId: string;
-  orderingKey: string;
+  message: OutboxMessage;
   error: unknown;
 }
 
 export interface PublicationReport {
   claimed: number;
-  published: number;
+  published: OutboxMessage[];
   failures: PublicationFailure[];
 }
 
@@ -36,7 +35,7 @@ export class PublishPendingEvents {
       }
       return {
         claimed: claimed.length,
-        published: results.reduce((total, result) => total + result.published, 0),
+        published: results.flatMap((result) => result.published),
         failures,
       };
     });
@@ -44,24 +43,23 @@ export class PublishPendingEvents {
 
   private async publishInOrder(
     sequence: OutboxMessage[],
-  ): Promise<{ touched: OutboxMessage[]; published: number; failure: PublicationFailure | undefined }> {
-    const touched: OutboxMessage[] = [];
+  ): Promise<{ touched: OutboxMessage[]; published: OutboxMessage[]; failure: PublicationFailure | undefined }> {
+    const published: OutboxMessage[] = [];
     for (const message of sequence) {
       try {
         await this.publisher.publish(message);
         message.markPublished(this.clock.now());
-        touched.push(message);
+        published.push(message);
       } catch (error) {
         message.scheduleRetry(this.clock.now());
-        touched.push(message);
         return {
-          touched,
-          published: touched.length - 1,
-          failure: { eventId: message.id, orderingKey: message.orderingKey, error },
+          touched: [...published, message],
+          published,
+          failure: { message, error },
         };
       }
     }
-    return { touched, published: touched.length, failure: undefined };
+    return { touched: published, published, failure: undefined };
   }
 }
 

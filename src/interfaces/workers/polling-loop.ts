@@ -8,6 +8,8 @@ export interface PollingLoopSettings {
   shutdownGraceMs: number;
 }
 
+export type CycleContext = (cycle: () => Promise<CycleResult>) => Promise<CycleResult>;
+
 export class PollingLoop {
   private stopping = false;
   private running: Promise<void> | undefined;
@@ -17,6 +19,7 @@ export class PollingLoop {
     private readonly name: string,
     private readonly settings: PollingLoopSettings,
     private readonly logger: Logger,
+    private readonly inContext: CycleContext,
     private readonly cycle: () => Promise<CycleResult>,
   ) {}
 
@@ -56,7 +59,7 @@ export class PollingLoop {
 
   private async loop(): Promise<void> {
     while (!this.stopping) {
-      if ((await this.runCycle()) === "IDLE") {
+      if ((await this.inContext(() => this.runCycle())) === "IDLE") {
         await this.pause();
       }
     }

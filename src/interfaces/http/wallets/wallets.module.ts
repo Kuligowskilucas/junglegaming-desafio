@@ -9,6 +9,7 @@ import { WalletRepository } from "../../../application/ports/wallet-repository";
 import { GetWallet } from "../../../application/wallet/get-wallet";
 import { ListWalletLedger } from "../../../application/wallet/list-wallet-ledger";
 import { OpenWallet } from "../../../application/wallet/open-wallet";
+import { ReconcileWallet } from "../../../application/wallet/reconcile-wallet";
 import { PersistenceModule } from "../../../infrastructure/database/persistence.module";
 import { SystemModule } from "../../../infrastructure/system/system.module";
 import { AuthGuard } from "../auth/auth.guard";
@@ -49,6 +50,12 @@ import { WalletsController } from "./wallets.controller";
       provide: ListWalletLedger,
       inject: [WalletRepository, WalletLedgerRepository],
       useFactory: (wallets: WalletRepository, ledger: WalletLedgerRepository) => new ListWalletLedger(wallets, ledger),
+    },
+    {
+      provide: ReconcileWallet,
+      inject: [WalletRepository, WalletLedgerRepository, TransactionRunner],
+      useFactory: (wallets: WalletRepository, ledger: WalletLedgerRepository, transactionRunner: TransactionRunner) =>
+        new ReconcileWallet(wallets, ledger, transactionRunner),
     },
   ],
 })

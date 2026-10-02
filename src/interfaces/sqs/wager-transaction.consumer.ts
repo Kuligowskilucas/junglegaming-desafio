@@ -9,6 +9,7 @@ import { backoffDelayMs } from "../../domain/shared/retry-backoff";
 import { AppConfig } from "../../infrastructure/config/app-config";
 import { DatabaseContext } from "../../infrastructure/database/database-context";
 import { isAcceptedCorrelationId } from "../../infrastructure/observability/correlation-id";
+import { secondsSince, WageringMetrics } from "../../infrastructure/observability/wagering-metrics";
 import { type ReceivedMessage, SqsQueueGateway } from "../../infrastructure/messaging/sqs-queue-gateway";
 import { ConcurrencyLimit } from "./concurrency-limit";
 import { classifyFailure, type FailureClassification } from "./failure-classification";
@@ -39,6 +40,7 @@ export class WagerTransactionConsumer implements OnApplicationBootstrap, BeforeA
     private readonly handler: HandleWagerTransactionRequested,
     private readonly databaseContext: DatabaseContext,
     private readonly pino: PinoLogger,
+    private readonly metrics: WageringMetrics,
     config: AppConfig,
   ) {
     this.settings = config.sqs.consumer;
@@ -150,28 +152,43 @@ export class WagerTransactionConsumer implements OnApplicationBootstrap, BeforeA
   }
 
   private async processInContext(message: ReceivedMessage): Promise<Disposition> {
+    const startedAt = performance.now();
     let envelope: WagerTransactionRequestedEnvelope | undefined;
     let result: MessageHandlingResult;
     try {
       envelope = parseWagerTransactionMessage(message.body);
       const received = message.attributes.correlationId;
       const correlationId = isAcceptedCorrelationId(received) ? received : envelope.messageId;
-      this.pino.assign({ messageId: envelope.messageId, correlationId });
+      this.pino.assign({
+        messageId: envelope.messageId,
+        correlationId,
+        walletId: envelope.data.walletId,
+        providerId: envelope.data.providerId,
+      });
       result = await this.handler.handle(
         toWagerTransactionRequest(envelope, { consumerName: this.settings.name, correlationId }),
       );
     } catch (error) {
       const failure = classifyFailure(error);
       return failure.kind === "PERMANENT"
-        ? this.deadLetter(message, envelope, failure)
-        : this.retryLater(message, failure, error);
+        ? this.deadLetter(message, envelope, failure, startedAt)
+        : this.retryLater(message, failure, error, startedAt);
     }
-    this.logHandled(result, envelope);
+    this.recordHandled(result, startedAt);
+    this.logHandled(result);
     await this.acknowledge(message);
     return "SETTLED";
   }
 
-  private logHandled(result: MessageHandlingResult, envelope: WagerTransactionRequestedEnvelope): void {
+  private recordHandled(result: MessageHandlingResult, startedAt: number): void {
+    if (result.outcome === "DUPLICATE") {
+      this.metrics.inboxDuplicate(secondsSince(startedAt));
+      return;
+    }
+    this.metrics.submissionCompleted("sqs", result.submission, secondsSince(startedAt));
+  }
+
+  private logHandled(result: MessageHandlingResult): void {
     if (result.outcome === "DUPLICATE") {
       this.logger.log("Duplicate message acknowledged without effects");
       return;
@@ -180,8 +197,6 @@ export class WagerTransactionConsumer implements OnApplicationBootstrap, BeforeA
     this.logger.log(
       {
         transactionId: transaction.id,
-        walletId: transaction.walletId,
-        providerId: envelope.data.providerId,
         status: transaction.status,
         failureCode: transaction.failureCode,
         idempotentReplay,
@@ -194,6 +209,7 @@ export class WagerTransactionConsumer implements OnApplicationBootstrap, BeforeA
     message: ReceivedMessage,
     envelope: WagerTransactionRequestedEnvelope | undefined,
     failure: Extract<FailureClassification, { kind: "PERMANENT" }>,
+    startedAt: number,
   ): Promise<Disposition> {
     try {
       await this.gateway.send(this.deadLetterQueueName, {
@@ -209,14 +225,23 @@ export class WagerTransactionConsumer implements OnApplicationBootstrap, BeforeA
         },
       });
     } catch (error) {
-      return this.retryLater(message, { kind: "TRANSIENT", code: "DEAD_LETTER_UNAVAILABLE" }, error);
+      return this.retryLater(message, { kind: "TRANSIENT", code: "DEAD_LETTER_UNAVAILABLE" }, error, startedAt);
     }
+    this.metrics.deadLettered(failure.code);
+    this.metrics.processingObserved("sqs", "DEAD_LETTER", secondsSince(startedAt));
     this.logger.warn({ errorCode: failure.code }, "Message sent to the dead-letter queue as a permanent failure");
     await this.acknowledge(message);
     return "SETTLED";
   }
 
-  private async retryLater(message: ReceivedMessage, failure: FailureClassification, error: unknown): Promise<Disposition> {
+  private async retryLater(
+    message: ReceivedMessage,
+    failure: FailureClassification,
+    error: unknown,
+    startedAt: number,
+  ): Promise<Disposition> {
+    this.metrics.retryScheduled("sqs_consumer", failure.code);
+    this.metrics.processingObserved("sqs", "RETRY", secondsSince(startedAt));
     const delaySeconds = Math.ceil(
       backoffDelayMs(
         { baseDelayMs: this.settings.retryBaseSeconds * 1_000, maxDelayMs: this.settings.retryMaxSeconds * 1_000 },

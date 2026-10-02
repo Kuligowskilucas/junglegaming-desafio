@@ -5,6 +5,9 @@ import type { SQL } from "bun";
 import { WagerTransactionKind } from "../../../src/domain/wagering/wager-transaction-kind";
 import { AuthGuard } from "../../../src/interfaces/http/auth/auth.guard";
 import { HealthController } from "../../../src/interfaces/http/health/health.controller";
+import { MetricsController } from "../../../src/interfaces/http/metrics/metrics.controller";
+import { ProviderTransactionsController } from "../../../src/interfaces/http/wagering/provider-transactions.controller";
+import { WageringController } from "../../../src/interfaces/http/wagering/wagering.controller";
 import { WalletsController } from "../../../src/interfaces/http/wallets/wallets.controller";
 import { createTestApp, type TestApp } from "../../support/create-test-app";
 import { connectSql, expectConstraintViolation, initOrm, resetDatabase } from "../../support/database";
@@ -330,9 +333,13 @@ describe("wallet endpoints against the real database", () => {
       }
     });
 
-    test("the AuthGuard extension point protects the wallet endpoints but not health", () => {
-      expect(Reflect.getMetadata(GUARDS_METADATA, WalletsController)).toEqual([AuthGuard]);
-      expect(Reflect.getMetadata(GUARDS_METADATA, HealthController)).toBeUndefined();
+    test("the AuthGuard extension point protects every business endpoint but not health or metrics", () => {
+      for (const controller of [WalletsController, WageringController, ProviderTransactionsController]) {
+        expect(Reflect.getMetadata(GUARDS_METADATA, controller)).toEqual([AuthGuard]);
+      }
+      for (const controller of [HealthController, MetricsController]) {
+        expect(Reflect.getMetadata(GUARDS_METADATA, controller)).toBeUndefined();
+      }
     });
   });
 });

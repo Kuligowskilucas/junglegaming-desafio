@@ -1,4 +1,4 @@
-import { Controller, Get, Logger, ServiceUnavailableException } from "@nestjs/common";
+import { Controller, Get, Logger, Res } from "@nestjs/common";
 import { AppConfig } from "../../../infrastructure/config/app-config";
 import { DatabaseHealth } from "../../../infrastructure/database/database-health";
 import { SqsHealth } from "../../../infrastructure/messaging/sqs-health";
@@ -21,14 +21,17 @@ export class HealthController {
   }
 
   @Get("ready")
-  async ready(): Promise<{ status: "ok"; checks: Record<string, DependencyStatus> }> {
+  async ready(
+    @Res({ passthrough: true }) response: { status(code: number): unknown },
+  ): Promise<{ status: "ok" | "unavailable"; checks: Record<string, DependencyStatus> }> {
     const [postgres, sqs] = await Promise.all([
       this.probe("postgres", () => this.database.check()),
       this.probe("sqs", (signal) => this.sqs.check(signal)),
     ]);
     const checks = { postgres, sqs };
     if (Object.values(checks).some((check) => check.status === "down")) {
-      throw new ServiceUnavailableException({ status: "unavailable", checks });
+      response.status(503);
+      return { status: "unavailable", checks };
     }
     return { status: "ok", checks };
   }

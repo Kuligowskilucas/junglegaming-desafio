@@ -1,8 +1,47 @@
 # Distributed Wagering Processor
 
-Serviço financeiro distribuído que processa transações de apostas (BET, WIN, LOSS, REFUND, ROLLBACK) de múltiplos provedores, com idempotência persistente, ledger imutável e transactional outbox. O enunciado completo está em [`docs/DESAFIO.md`](docs/DESAFIO.md). As decisões técnicas e os trade-offs estão em [`ARCHITECTURE.md`](ARCHITECTURE.md).
+Serviço financeiro que processa transações de apostas (BET, WIN, LOSS, REFUND e ROLLBACK) recebidas de vários provedores de jogos, por HTTP e por SQS, e mantém a carteira (wallet) de cada jogador. Ele continua correto quando as mensagens chegam duplicadas, fora de ordem ou ao mesmo tempo em várias instâncias.
 
-**Status:** Etapas 1 a 6 concluídas: infra local, aplicação NestJS em Bun, config validada, logs JSON, health checks; o modelo de domínio (Money, Wallet, ledger, WagerTransaction, regras de BET/WIN/LOSS/REFUND/ROLLBACK, inbox, outbox e eventos); o schema PostgreSQL com as garantias no banco (constraints, índices e triggers), a persistência, os endpoints de wallet, a submissão de transações com idempotência, lock por wallet e outbox, testada com concorrência real; o consumer SQS com inbox, ack após o commit, backoff, DLQ e shutdown limpo; o publisher do outbox (várias instâncias, ordem por wallet, retry) e o worker que resolve as transações em PENDING_REFERENCE; a reconciliação de wallet, as métricas Prometheus e a revisão dos logs; e os testes com processos reais (3+ instâncias, `kill -9`, SIGTERM e reinício), a imagem Docker e as réplicas no compose.
+**Garantias** (cada uma com a decisão e a prova no [ARCHITECTURE.md](ARCHITECTURE.md)):
+- **Dinheiro exato:** valores com exatamente 2 casas decimais, sem `number` em nenhum ponto (D9, D18).
+- **Idempotência persistente:** a mesma operação reenviada devolve o resultado original; a mesma chave com outro payload é conflito (D13, D19, D25).
+- **Sem lost update nem saldo negativo:** cada wallet é travada na própria linha do banco, sem lock global (D24).
+- **Ledger imutável e coerente com o saldo**, garantido por constraints e triggers no banco, não só no código (D11, D17).
+- **Nenhum evento antes do commit:** os eventos entram num transactional outbox na mesma transação SQL e são publicados depois, em ordem por wallet (D35–D37).
+- **Correto com várias instâncias:** provado com 3 processos reais, `kill -9`, SIGTERM e reinício (D48–D50).
+
+O [mapa de avaliação](ARCHITECTURE.md#1-mapa-de-avaliação) aponta, para cada critério, as decisões, o código e os testes.
+
+## Sumário
+
+- [Visão rápida](#visão-rápida)
+- [Pré-requisitos](#pré-requisitos)
+- [Setup do zero](#setup-do-zero)
+- [Rodando várias instâncias (Docker)](#rodando-várias-instâncias-docker)
+- [Comandos](#comandos)
+- [API](#api)
+- [Mensageria (SQS)](#mensageria-sqs)
+- [Observabilidade](#observabilidade)
+- [Testes](#testes)
+- [Configuração](#configuração)
+- [Solução de problemas](#solução-de-problemas)
+- [Documentação](#documentação)
+
+## Visão rápida
+
+```
+     provedores (HTTP)                                  wager-transactions.fifo (SQS)
+            │                                                        │
+            ▼                                                        ▼
+   POST /wagering/transactions                     consumer (inbox na mesma transação)
+            └──────────────────────► núcleo transacional ◄───────────┘
+                     lock da wallet → regras de negócio → transação + ledger + saldo + outbox
+                                        │  uma transação SQL no PostgreSQL
+                                        ▼
+            worker de PENDING_REFERENCE      publisher do outbox ──► wager-events.fifo (SQS)
+```
+
+Cada instância roda a API HTTP, o consumer, o publisher e o worker; todas compartilham o mesmo Postgres e as mesmas filas. A arquitetura completa está na [visão geral do ARCHITECTURE.md](ARCHITECTURE.md#2-visão-geral).
 
 ## Pré-requisitos
 
@@ -18,6 +57,8 @@ bun --version   # 1.4.2
 Não é preciso ter Node nem conta na LocalStack. A imagem `localstack/localstack:4.14.0` roda sem token (ver ARCHITECTURE.md, D1).
 
 ## Setup do zero
+
+Uma instância no host, para desenvolver:
 
 ```bash
 cp .env.example .env
@@ -56,7 +97,7 @@ bun run verify:replicas
 O `verify:replicas` (`scripts/verify-replicas.ts`):
 1. confere o `/health/ready` de cada réplica;
 2. manda a mesma aposta 30 vezes, espalhada entre as réplicas (um débito só);
-3. roda o cenário da seção 8 com as duas apostas em réplicas diferentes;
+3. manda duas apostas de 80.00 sobre um saldo de 100.00 a réplicas diferentes (uma processada, outra rejeitada);
 4. publica 30 mensagens na fila (mais uma reentrega) e espera o processamento;
 5. confere que o outbox foi todo publicado;
 6. reconcilia todas as wallets tocadas, alternando as réplicas.
@@ -96,13 +137,13 @@ As réplicas usam o banco `wagering` e as filas padrão, as mesmas de um `bun ru
 | `bun run dev` | Sobe a API com reload |
 | `bun run start` | Sobe a API sem reload |
 | `bun run typecheck` | `tsc --noEmit` (TypeScript 6.0.3, modo estrito) |
-| `bun test` | Todos os testes (unitários e de integração) |
-| `bun run test:unit` | Só os testes sem I/O (domínio, arquitetura, config) |
-| `bun run test:integration` | Só os testes contra Postgres e SQS reais |
-| `bun run test:concurrency` | Só os cenários com paralelismo real (seção 8, mesma aposta 50×, wallet quente, reversões simultâneas) |
-| `bun run test:multiprocess` | Só os testes com processos reais da aplicação (3+ instâncias, `kill -9`, SIGTERM, reinício); ~33 s |
+| `bun test` | Todos os testes: unitários, integração, concorrência e multiprocesso (ver [Testes](#testes)) |
+| `bun run test:unit` | Só os testes sem I/O |
+| `bun run test:integration` | Só os testes contra Postgres e LocalStack reais |
+| `bun run test:concurrency` | Só os cenários com paralelismo real no HTTP |
+| `bun run test:multiprocess` | Só os testes com processos reais da aplicação |
 | `docker compose --profile app up -d --build --wait` | Builda a imagem, aplica as migrations e sobe 3 réplicas (portas 3001–3003) |
-| `bun run verify:replicas` | Verifica as réplicas de ponta a ponta (ver "Rodando várias instâncias") |
+| `bun run verify:replicas` | Verifica as réplicas de ponta a ponta (ver [Rodando várias instâncias](#rodando-várias-instâncias-docker)) |
 | `bun run db:migrate` | Aplica as migrations pendentes (7: wallets, transações, ledger, coerência, inbox, outbox, ordem do outbox e correlação) |
 | `bun run db:migrate:down` | Reverte a última migration |
 | `bun run db:migration:create` | Cria uma migration em branco (SQL escrito à mão) |
@@ -111,6 +152,19 @@ As réplicas usam o banco `wagering` e as filas padrão, as mesmas de um `bun ru
 Para rodar as migrations no banco de testes: `NODE_ENV=test bun run db:migrate`. O Bun passa a carregar o `.env.test`, que aponta para `wagering_test`.
 
 ## API
+
+| Método e rota | O que faz | Respostas principais |
+|---|---|---|
+| `POST /wallets` | Cria a wallet; com saldo inicial maior que zero, grava também a transação OPENING e o crédito no ledger | 201, 409 `WALLET_ALREADY_EXISTS`, 400 |
+| `GET /wallets/:walletId` | Saldo e versão | 200, 404 |
+| `GET /wallets/:walletId/ledger?limit=&cursor=` | Lançamentos do mais recente para o mais antigo, com cursor opaco e estável | 200, 400 `INVALID_CURSOR`, 404 |
+| `POST /wallets/:walletId/reconciliation` | Compara o saldo gravado com o reconstruído pelo ledger | 200 (`consistent: true` ou `false`), 404 |
+| `POST /wagering/transactions` | Submete BET, WIN, LOSS, REFUND ou ROLLBACK; o header `Idempotency-Key` é obrigatório | 200, 202, 422, 409, 404, 400, 503 |
+| `GET /wagering/transactions/:transactionId` | Visão completa da transação | 200, 404 |
+| `GET /providers/:providerId/wagering/transactions/:externalTransactionId` | A mesma visão, pelo id do provedor | 200, 404 |
+| `GET /health/live` | Processo vivo | 200 |
+| `GET /health/ready` | Postgres e SQS alcançáveis | 200, 503 |
+| `GET /metrics` | Métricas no formato do Prometheus | 200 |
 
 Os erros saem em `application/problem+json` (RFC 9457) com `code`, `retryable` e `correlationId`. A tabela completa está em ARCHITECTURE.md, D23.
 
@@ -135,7 +189,19 @@ curl -s localhost:3000/wagering/transactions/<transactionId>
 curl -s localhost:3000/providers/provider-a/wagering/transactions/transaction-123
 ```
 
-Status da submissão (ARCHITECTURE.md, D27): 200 PROCESSED, 202 PENDING_REFERENCE (referência ainda não chegou; o worker a resolve quando ela chegar, D38), 422 rejeição de negócio (`code` = `failureCode`), 409 conflito de idempotência, 400 payload inválido, 503 com `Retry-After` para falha transitória (reenviar a mesma requisição é seguro).
+**Status da submissão** (ARCHITECTURE.md, D27):
+
+| Status | Quando |
+|---|---|
+| 200 | PROCESSED, inclusive no replay (`idempotentReplay: true`) |
+| 202 | PENDING_REFERENCE: a referência ainda não chegou; o worker resolve quando ela chegar (D38) |
+| 422 | Rejeição de negócio, com `code` = `failureCode` (por exemplo `INSUFFICIENT_FUNDS`), ou jogador que não é dono da wallet |
+| 409 | Mesma `Idempotency-Key` com outro payload, ou mesmo id externo com outra key |
+| 404 | Wallet inexistente |
+| 400 | Payload, `Money` ou `Idempotency-Key` inválidos |
+| 503 | Falha transitória (banco fora, lock timeout), com `Retry-After`; reenviar a mesma requisição é seguro |
+
+O `amount` precisa ter exatamente 2 casas decimais (`"25.00"`).
 
 ```bash
 # reconciliação: saldo gravado × saldo reconstruído pelo ledger, numa leitura em snapshot que não bloqueia escritas
@@ -145,11 +211,9 @@ curl -s -X POST localhost:3000/wallets/<walletId>/reconciliation
 
 Uma divergência volta 200 com `consistent: false`, nunca é corrigida, gera um log `error` (só `walletId`, `difference` e `checkedEntries`) e conta em `wagering_reconciliations_total{result="inconsistent"}` (ARCHITECTURE.md, D42).
 
-O `amount` precisa ter exatamente 2 casas decimais (`"25.00"`). O ledger vem do lançamento mais recente para o mais antigo, e o cursor é opaco e estável mesmo com lançamentos novos chegando durante a paginação.
-
 ## Mensageria (SQS)
 
-Com `SQS_CONSUMER_ENABLED=true` (padrão no `.env.example`), o processo da API também consome `wager-transactions.fifo`. A mensagem segue o envelope da seção 10 do enunciado, com `MessageGroupId` = `walletId` e `MessageDeduplicationId` = `messageId` (contrato em ARCHITECTURE.md, D32):
+Com `SQS_CONSUMER_ENABLED=true` (padrão no `.env.example`), o processo da API também consome `wager-transactions.fifo`. A mensagem é o envelope `WagerTransactionRequested`, com `MessageGroupId` = `walletId` e `MessageDeduplicationId` = `messageId` (contrato em ARCHITECTURE.md, D32):
 
 ```bash
 BODY='{"messageId":"msg-123","type":"WagerTransactionRequested","occurredAt":"2026-07-29T15:00:00.000Z","data":{"providerId":"provider-a","externalTransactionId":"transaction-123","idempotencyKey":"provider-a:transaction-123","playerId":"<playerId>","walletId":"<walletId>","roundId":"round-987","gameId":"fortune-chimp","kind":"BET","money":{"amount":"25.00","currency":"BRL"}}}'
@@ -164,11 +228,19 @@ docker compose exec sqs sh -c 'awslocal sqs receive-message --message-attribute-
   --queue-url "$(awslocal sqs get-queue-url --queue-name wager-transactions-dlq.fifo --query QueueUrl --output text)"'
 ```
 
-Erros de negócio (por exemplo, saldo insuficiente) viram transação REJECTED e a mensagem recebe ack. Erros transitórios são retentados com backoff exponencial e só vão para a DLQ depois de `SQS_MAX_RECEIVE_COUNT` entregas (≈ 13,5 min). Erros permanentes (payload inválido, wallet inexistente, conflito de idempotência) vão direto para a DLQ com `errorCode`.
+O consumer trata cada tipo de erro de um jeito (D30):
+- **Erros de negócio** (por exemplo, saldo insuficiente) viram transação REJECTED, e a mensagem recebe ack.
+- **Erros transitórios** são retentados com backoff exponencial e só vão para a DLQ depois de `SQS_MAX_RECEIVE_COUNT` entregas (≈ 13,5 min).
+- **Erros permanentes** (payload inválido, wallet inexistente, conflito de idempotência) vão direto para a DLQ com `errorCode`.
 
 ### Eventos publicados
 
-Com `OUTBOX_PUBLISHER_ENABLED=true` (padrão no `.env.example`), os eventos do outbox (`WagerTransactionProcessed`, `WagerTransactionRejected`, `WagerTransactionPendingReference`, `WalletBalanceChanged`) vão para `wager-events.fifo`, em ordem por wallet: `MessageGroupId` = `walletId`, `MessageDeduplicationId` = `eventId`, corpo = envelope do evento e atributos `eventType`, `eventId`, `aggregateId`, `correlationId` e `version` (ARCHITECTURE.md, D35). Quem consome deve deduplicar por `eventId`.
+Com `OUTBOX_PUBLISHER_ENABLED=true` (padrão no `.env.example`), os eventos do outbox (`WagerTransactionProcessed`, `WagerTransactionRejected`, `WagerTransactionPendingReference`, `WalletBalanceChanged`) vão para `wager-events.fifo`, em ordem por wallet (ARCHITECTURE.md, D35):
+- `MessageGroupId` = `walletId` e `MessageDeduplicationId` = `eventId`;
+- corpo = envelope do evento;
+- atributos `eventType`, `eventId`, `aggregateId`, `correlationId` e `version`.
+
+Quem consome deve deduplicar por `eventId`.
 
 ```bash
 docker compose exec sqs sh -c 'awslocal sqs receive-message --max-number-of-messages 10 \
@@ -193,9 +265,20 @@ curl -s localhost:3000/providers/provider-a/wagering/transactions/refund-1
 
 Os eventos que o worker emite carregam o `correlationId` da requisição original (`refund-request-1`).
 
-## Métricas
+## Observabilidade
 
-`GET /metrics` expõe as métricas no formato de texto do Prometheus, sem autenticação, como o health (ARCHITECTURE.md, D43 a D46). Todas as próprias começam com `wagering_`, e as de processo (`process_*`, `nodejs_*`) vêm junto.
+**Logs:** JSON, uma linha por evento (D5, D47).
+- **Campos de rastreio:** cada linha leva `correlationId` (do header `x-correlation-id` ou gerado) e, quando existem no caminho, `messageId`, `transactionId`, `walletId` e `providerId`. Isso vale para HTTP, consumer, publisher e worker.
+- **O que nunca entra:** corpo, headers e saldos. Nos erros, os valores monetários das mensagens são mascarados.
+
+```bash
+bun run dev | bunx pino-pretty                                   # legível no terminal
+bun run dev | grep '"correlationId":"refund-request-1"'          # tudo de uma requisição, inclusive os eventos do worker
+```
+
+**Health:** `GET /health/live` (processo vivo, sem consultar dependências) e `GET /health/ready` (Postgres e as três filas, com timeout; 503 se alguma falha) (D6).
+
+**Métricas:** `GET /metrics` expõe o formato de texto do Prometheus, sem autenticação, como o health (ARCHITECTURE.md, D43 a D46). Todas as métricas próprias começam com `wagering_`, e as de processo (`process_*`, `nodejs_*`) vêm junto.
 
 ```bash
 curl -s localhost:3000/metrics | grep '^wagering_' | grep -v _bucket
@@ -212,32 +295,34 @@ curl -s localhost:3000/metrics | grep '^wagering_' | grep -v _bucket
 | Latência p95 por origem | `histogram_quantile(0.95, sum by (le, source) (rate(wagering_processing_duration_seconds_bucket[5m])))` |
 | Sonda do scrape falhando | `increase(wagering_metrics_probe_failures_total[5m]) > 0` |
 
-Com várias instâncias, some contadores e use `max` nos gauges, que são consultados no banco e no SQS e saem iguais em todas.
+Com várias instâncias, some os contadores e use `max` nos gauges, que são consultados no banco e no SQS e saem iguais em todas.
 
 ## Testes
 
-- **Unitários** (`test/unit`) não fazem I/O e não precisam da infra: domínio (`test/unit/domain`, incluindo regras de negócio, transições de status, hash de payload e um teste de propriedade do ledger com seed fixa), regra de dependência entre camadas (`test/unit/architecture`) e config.
-- **Integração** (`test/integration`) usam PostgreSQL e LocalStack reais, sem mocks: migrations (up → down passo a passo → up), cada constraint e trigger violado por SQL, a coerência saldo ↔ ledger ↔ transação no COMMIT, repositórios e os endpoints de wallet (atomicidade, 10 POSTs simultâneos, cursor estável). A infra precisa estar de pé (`docker compose up -d --wait`). Se não estiver, o teste falha na hora com essa instrução.
-- O `bun test` define `NODE_ENV=test` e carrega o `.env.test` por cima do `.env`. Os testes usam o banco **`wagering_test`**, criado pelo init do Postgres, e não tocam no banco de desenvolvimento.
-- **Sem paralelismo entre arquivos que limpam o banco.** O `bun test` roda os arquivos em série por padrão, e os scripts nunca passam `--parallel`. Além disso, todo arquivo de integração chama `useIntegrationEnvironment()` (`test/support/integration.ts`). Ela toma um advisory lock no Postgres (`pg_advisory_lock`) numa conexão dedicada durante o arquivo inteiro. Mesmo com `bun test --parallel`, os arquivos de integração esperam uns pelos outros em vez de mexer nos dados de outro teste.
-- Cada arquivo fecha a sua app Nest e as suas conexões no `afterAll`, porque os arquivos dividem o mesmo processo.
-- **Consumer SQS** (`test/integration/sqs`): cada teste cria um par de filas FIFO próprio, com visibilidade curta, e cobre redelivery, crash entre commit e ack, retry transitório, DLQ, ordem por grupo e shutdown.
-- **Reconciliação, métricas e logs** (`test/integration/http/reconciliation.test.ts`, `test/integration/application/reconcile-wallet.test.ts`, `test/integration/observability`): a divergência é provocada desligando os triggers só na transação do teste (`SET LOCAL session_replication_role = replica`, o usuário do container é superusuário) e restaurada no fim; um teste determinístico confirma uma BET entre as duas leituras da reconciliação para provar o snapshot; as métricas são conferidas pelo `/metrics` real; os logs são capturados de um destino comum aos testes e varridos atrás de valores-canário, chaves proibidas e chaves duplicadas.
-- **Publisher e worker** (`test/integration/workers`): cada teste do publisher usa uma fila de eventos própria e cobre dois publishers simultâneos (ordem por wallet, sem envio duplicado), instância morta antes de publicar, envio sem marcação absorvido pela deduplicação da FIFO, retry com backoff e evento em backoff segurando os seguintes da wallet. Os do worker cobrem REFUND antes da BET, ROLLBACK antes do WIN, o empurrão, novas tentativas, limite esgotado, replay, concorrência com o HTTP e dois workers.
-- **Processos reais** (`test/multiprocess`, ~33 s): cada teste sobe a aplicação como processos do sistema operacional (`bun src/main.ts`, o mesmo entrypoint da produção) em portas livres, com o env do cenário, e espera o `/health/ready`. Os cenários:
-  - 3 instâncias recebendo a mesma aposta e a seção 8 divididas entre elas;
-  - consumers de 3 processos na mesma fila e publishers de 2 processos;
-  - `kill -9` entre o commit e o ack, antes do commit e no meio da publicação;
-  - SIGTERM real com mensagem em andamento;
-  - reinício depois de `kill -9`, SIGTERM e queda total, com a prova de consistência final.
+| Suíte | Comando | O que cobre | Testes | Duração |
+|---|---|---|---|---|
+| Unitários | `bun run test:unit` | Domínio (Money, Wallet, ledger, regras de cada kind, transições, hash do payload, propriedade do ledger com seed fixa), regra de dependência entre camadas, config, serializer de erros e helpers do consumer. Não precisa da infra | 308 | 0,1 s |
+| Integração | `bun run test:integration` | Migrations (up, down e up), cada constraint e trigger, coerência saldo × ledger × transação, repositórios, endpoints, consumer SQS (redelivery, crash entre commit e ack, retry, DLQ, shutdown), publisher e worker, reconciliação, métricas e logs | 185 | 41 s |
+| Concorrência | `bun run test:concurrency` | Duas apostas de 80.00 sobre 100.00, a mesma aposta 50× em paralelo, wallet quente, wallets distintas em paralelo, REFUND × ROLLBACK, lock timeout | 8 | 5 s |
+| Multiprocesso | `bun run test:multiprocess` | 3 processos reais da aplicação: mesma aposta e saldo disputado entre instâncias, consumers e publishers em processos diferentes, `kill -9` antes do commit, entre o commit e o ack e no meio da publicação, SIGTERM real, reinício com prova de consistência final | 10 | 33 s |
+| Tudo | `bun test` | As quatro acima | 511 | 76 s |
+| Tudo, arquivos em paralelo | `bun test --parallel` | Idem; os arquivos de integração continuam se revezando pelo advisory lock | 511 | 79 s |
 
-  A janela entre o commit e o ack é acertada por um proxy de teste entre o processo e o LocalStack (`test/support/sqs-fault-proxy.ts`), que segura o `DeleteMessage`; a aplicação não tem gancho para isso. Os processos são encerrados no `afterEach` e na saída do runner. Os logs de cada um ficam em `$TMPDIR/wagering-multiprocess/<execução>/`.
-- **Concorrência** (`test/concurrency`): requisições HTTP em paralelo contra o Postgres real. O cliente reenvia ao receber 503, respeitando o `Retry-After`, e cada cenário registra quantos 503 recebeu (resumo no fim da execução). Depois de cada teste, todas as wallets são conferidas contra o ledger. O `.env.test` usa `DB_POOL_MAX=20` para haver paralelismo real no banco.
-- **Limpeza sem desligar triggers:** os arquivos que usam tabelas chamam `resetDatabase()`, que derruba e recria o schema (`DROP SCHEMA` + migrations) dentro do lock. O ledger é imutável e nem os testes apagam linhas dele. O reset recusa bancos cujo nome não termine em `_test`.
+As durações foram medidas em WSL2 (Ryzen 5 5500, 12 threads, 15 GB), com Postgres e LocalStack locais, e são indicativas. Todas as suítes, menos a unitária, precisam da infra de pé (`docker compose up -d --wait`); sem ela, o arquivo falha na hora com essa instrução.
+
+- **Sem mocks de infraestrutura:** integração, concorrência e multiprocesso usam PostgreSQL e LocalStack reais. Depois de cada teste, todas as wallets do banco são conferidas: saldo = saldo reconstruído pelo ledger.
+- **Banco separado:** o `bun test` define `NODE_ENV=test` e carrega o `.env.test` por cima do `.env`. Os testes usam o banco **`wagering_test`**, criado pelo init do Postgres, e não tocam no banco de desenvolvimento. O reset recusa bancos cujo nome não termine em `_test`.
+- **Isolamento entre arquivos:** todo arquivo que usa a infra chama `useIntegrationEnvironment()` (`test/support/integration.ts`), que toma um advisory lock no Postgres durante o arquivo inteiro. Mesmo com `--parallel`, esses arquivos se revezam em vez de mexer nos dados uns dos outros. Os scripts nunca passam `--parallel`.
+- **Limpeza sem desligar triggers:** cada arquivo chama `resetDatabase()`, que derruba e recria o schema (`DROP SCHEMA` + migrations) dentro do lock. O ledger é imutável, e nem os testes apagam linhas dele.
+- **Filas próprias:** cada teste de mensageria cria filas FIFO próprias, com visibilidade curta, e as apaga no fim.
+- **Processos reais** (`test/multiprocess`): cada teste sobe a aplicação como processos do sistema operacional (`bun src/main.ts`, o mesmo entrypoint da produção) em portas livres e espera o `/health/ready`.
+  - A janela entre o commit e o ack é acertada por um proxy de teste entre o processo e o LocalStack (`test/support/sqs-fault-proxy.ts`), que segura o `DeleteMessage`; a aplicação não tem gancho para isso (D49).
+  - Os processos são encerrados no `afterEach` e na saída do runner, e os logs de cada um ficam em `$TMPDIR/wagering-multiprocess/<execução>/`.
+- **Concorrência** (`test/concurrency`): o cliente reenvia ao receber 503, respeitando o `Retry-After`, e cada cenário registra quantos 503 recebeu (resumo no fim da execução). O `.env.test` usa `DB_POOL_MAX=20` para haver paralelismo real no banco.
 
 ## Configuração
 
-Toda a configuração vem de variáveis de ambiente, validadas na subida. Com algum valor inválido, a aplicação não sobe e lista os campos com problema. O Bun carrega o `.env` automaticamente, e o Compose lê o mesmo arquivo.
+Toda a configuração vem de variáveis de ambiente, validadas na subida. Com algum valor inválido, a aplicação não sobe e lista os campos com problema. O Bun carrega o `.env` automaticamente, e o Compose lê o mesmo arquivo. Os valores do `.env.example` (`wagering`/`wagering` no Postgres, `test`/`test` no LocalStack) são padrões do ambiente local, não segredos; fora dele, as credenciais vêm do ambiente.
 
 | Variável | Padrão | Descrição |
 |---|---|---|
@@ -277,3 +362,12 @@ Toda a configuração vem de variáveis de ambiente, validadas na subida. Com al
 - **Logs legíveis no terminal:** `bun run dev | bunx pino-pretty`.
 - **Processos de teste órfãos** (só se o runner for morto com `kill -9` no meio de `test/multiprocess`): `pkill -f -- --wagering-test-instance`. O marcador só existe na linha de comando dos processos dos testes, então `bun run dev`, `bun run start` e as réplicas do compose não são afetados.
 - **Portas 3001–3003 ocupadas para as réplicas:** use outra faixa, por exemplo `APP_PORTS=4001-4003 docker compose --profile app up -d --wait` e `REPLICA_PORTS=4001,4002,4003 bun run verify:replicas`.
+
+## Documentação
+
+O [ARCHITECTURE.md](ARCHITECTURE.md) tem:
+- o [mapa de avaliação](ARCHITECTURE.md#1-mapa-de-avaliação), de cada critério para as decisões, o código e os testes;
+- a [visão geral](ARCHITECTURE.md#2-visão-geral);
+- as decisões D1–D53, com opções, trade-offs e evidências;
+- o [desenho de autenticação](ARCHITECTURE.md#13-autenticação);
+- as [limitações conhecidas](ARCHITECTURE.md#14-limitações-conhecidas).

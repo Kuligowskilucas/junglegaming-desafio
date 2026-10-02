@@ -151,7 +151,7 @@ Formato: uma linha JSON por evento com `level` (label), `time` (ISO-8601), `serv
 
 Isolamento:
 1. **Banco separado** `wagering_test`, criado pelo init do Postgres e selecionado pelo `.env.test`.
-2. **Serialização entre arquivos:** o `bun test` roda os arquivos em série por padrão. Como garantia que não depende de flag, `useIntegrationEnvironment()` toma `pg_advisory_lock(<chave fixa>)` numa conexão dedicada (`Bun.SQL.reserve()`, sem dependência nova) no `beforeAll` e libera no `afterAll`. Com `bun test --parallel`, que distribui os arquivos entre processos, os arquivos de integração esperam uns pelos outros. **Verificado:** dois arquivos em processos distintos executaram em sequência estrita, o segundo começando só depois de o primeiro liberar o lock. Os processos filhos dos testes multi-instância (Etapa 6) não pedem esse lock e não ficam bloqueados por ele.
+2. **Serialização entre arquivos:** o `bun test` roda os arquivos em série por padrão. Como garantia que não depende de flag, `useIntegrationEnvironment()` toma `pg_advisory_lock(<chave fixa>)` numa conexão dedicada (`Bun.SQL.reserve()`, sem dependência nova) no `beforeAll` e libera no `afterAll`. Com `bun test --parallel`, que distribui os arquivos entre processos, os arquivos de integração esperam uns pelos outros. **Verificado:** dois arquivos em processos distintos executaram em sequência estrita, o segundo começando só depois de o primeiro liberar o lock. Os processos filhos dos testes multi-instância (Etapa 6b, D48) não pedem esse lock e não ficam bloqueados por ele. Desde a 6b, a espera pelo lock vai até 600 s (a soma dos arquivos de integração cresceu), e `useIntegrationEnvironment({ testTimeoutMs })` permite timeout próprio por arquivo (120 s nos multiprocesso).
 3. **Preflight:** se Postgres ou SQS não respondem, o arquivo falha de imediato com a instrução de subir a infra.
 4. A estratégia de limpeza de dados entre testes, incluindo a convivência com os triggers de imutabilidade do ledger, é definida na Etapa 3, sempre dentro do lock.
 
@@ -846,7 +846,7 @@ O `findById` da wallet passou a usar `refresh: true`, para que o identity map n�
 | Opção | Resultado |
 |---|---|
 | **Aberto como o health (escolhida)** | O Prometheus faz scrape sem credencial; o conteúdo é operacional (contagens, latências, profundidades), sem id, saldo nem dado de jogador. Fica fora do log automático de request, como `/health` |
-| Atrás do `AuthGuard` | Hoje o guard é no-op. Com autenticação real (seção 10), o scraper precisaria de um client e de um escopo próprios |
+| Atrás do `AuthGuard` | Hoje o guard é no-op. Com autenticação real (seção 11), o scraper precisaria de um client e de um escopo próprios |
 | Porta separada | Um segundo servidor HTTP no processo |
 
 Em produção, a rota não sai pelo ingress público (rede interna ou allowlist). Quem alcança a porta vê volume e taxa de erro.
@@ -881,17 +881,169 @@ Em produção, a rota não sai pelo ingress público (rede interna ou allowlist)
 - que nenhuma linha tem chave proibida (`money`, `amount`, `balance`, `payload`, `body`, `headers`, `playerId`, `detail`);
 - que nenhuma linha tem chave duplicada.
 
-## 10. Autenticação
+## 10. Múltiplas instâncias, falhas de processo e empacotamento
+
+Etapa 6b: testes com processos reais da aplicação (seção 13: ≥ 3 instâncias, worker morto entre o commit e o ack, dois publishers, reinício com consistência final), a imagem Docker e as réplicas no compose.
+
+### D48. Testes com processos reais
+
+| Opção | Resultado |
+|---|---|
+| **Processos do host com `Bun.spawn([bun, "src/main.ts"])` (escolhida)** | O mesmo entrypoint da produção; 3 processos ficam prontos em ~0,7 s; `kill -9` e SIGTERM exatos por PID; env e porta por processo; nada para buildar |
+| Réplicas do compose (`docker kill`) | Exercita a imagem, mas o build e a subida são lentos, o env por teste é difícil, e o proxy de falhas (D49) precisaria rodar dentro da rede do compose |
+
+**`test/support/app-process.ts`:**
+- **`AppProcess.start(nome, env)`:**
+  - **Porta:** uma porta livre (`Bun.listen` na 0, lê e fecha).
+  - **Env:** o do runner (`.env` + `.env.test`, banco `wagering_test`) mais as sobrescritas do cenário: `DB_POOL_MAX=6`, long polling de 1 s, polls de 100 ms, backoff de 1 s, filas do teste e as flags de cada laço.
+  - **Logs:** stdout em `$TMPDIR/wagering-multiprocess/<execução>/<nome>-<porta>.log`.
+- **Readiness:** `GET /health/ready` = 200, com limite de 20 s. O consumer e os workers começam no `onApplicationBootstrap`, antes do `listen`, então "pronto" já é "laços rodando". Se o processo morre antes, o erro traz o final do log.
+- **Encerramento:** `terminate()` (SIGTERM, com limite de 25 s antes de SIGKILL e falha) e `kill()` (SIGKILL). As duas devolvem o código ou o sinal de saída.
+- **Encerramento garantido:**
+  - o `afterEach`/`afterAll` faz `AppProcess.stopAll()` (SIGKILL em todos e espera a saída);
+  - um `process.once("exit")` no runner mata o que sobrar;
+  - toda espera tem limite, e o erro anexa o final dos logs;
+  - cada teste usa filas e portas próprias, então um órfão não contamina a execução seguinte;
+  - os filhos levam o marcador `--wagering-test-instance` na linha de comando (a app ignora `argv`), para que `pkill -f -- --wagering-test-instance` encerre só eles, e não um `bun run dev` nem as réplicas do compose, que também aparecem no `ps` do host.
+- **Observação de fora:** os testes leem o `/metrics` **de cada processo** (quem processou, quantas duplicatas, quantas publicações) e o arquivo de log dele.
+- **`FleetClient`:** distribui as requisições entre os processos vivos e, em erro de conexão ou 503, reenvia a **mesma** requisição (mesma `Idempotency-Key`) para outro processo, como um provedor faria.
+
+**Cenários** (`test/multiprocess/`, 10 testes):
+
+| Arquivo | Cenários |
+|---|---|
+| `http-instances` | A mesma aposta 50× espalhada entre 3 processos (um débito; 49 replays somados das métricas de ≥ 2 processos); a seção 8 dividida entre processos em 20 wallets, com reenvio para o terceiro; 10 wallets × 30 BETs espalhadas (100 por processo, saldos exatos) |
+| `messaging-instances` | Consumers de 3 processos na mesma fila (150 mensagens, reentregas e mesma chave com outro `messageId`; ≥ 2 processos consumiram); publishers de 2 processos (150 eventos, ordem por wallet, envios somados = eventos, divisão medida 72/78 e 76/74); publisher morto depois do aceite do SQS |
+| `process-failures` | `kill -9` entre o commit e o ack; `kill -9` antes do commit; SIGTERM real com mensagem em andamento |
+| `restart-consistency` | D50 |
+
+### D49. Proxy de falhas e a janela entre o commit e o ack (P5, P6)
+
+Depois do COMMIT, o consumer só faz trabalho em memória (métrica, log) e chama `DeleteMessage`. Não há acesso ao banco nessa janela, que dura milissegundos.
+
+| Opção | Resultado |
+|---|---|
+| **Proxy SQS de teste entre o processo e o LocalStack (escolhida)** | O processo roda o binário de produção sem alteração (só `SQS_ENDPOINT` aponta para o proxy) e é determinístico. Nenhum gancho no código de produção |
+| Entrypoint de teste que embrulha o `SqsQueueGateway.delete` | Determinístico, mas o processo morto não é o binário de produção |
+| Observar o inbox e mandar `kill -9`/SIGSTOP | Corrida de milissegundos; não determinístico |
+| Variável de ambiente na app (`ACK_DELAY_MS`) | Gancho em produção que pode ser ativado por engano (vedado) |
+| Chaos API do LocalStack | Só na versão Pro |
+
+**Proxy** (`test/support/sqs-fault-proxy.ts`): `Bun.serve` numa porta livre, que encaminha método, headers e corpo ao LocalStack.
+- O SDK v3 do SQS usa protocolo JSON, com a operação em `X-Amz-Target: AmazonSQS.<Operação>`.
+- Como o `SQSClient` da app tem `endpoint` explícito, o SDK nunca troca o host pelo da QueueUrl (o `queueUrlMiddleware` só age sem `endpoint`), então nenhuma chamada contorna o proxy.
+- Na resposta, o proxy descarta `content-encoding` e `content-length`, porque o `fetch` já descompactou o corpo.
+- Duas regras, armadas pelo teste:
+  - **`holdBeforeForwarding("DeleteMessage")`:** não encaminha nem responde, e avisa o teste. O LocalStack nunca recebe o ack.
+  - **`holdAfterForwarding("SendMessage")`:** encaminha e retém a resposta. É o "SQS aceitou e o processo morreu antes de marcar `published_at`".
+
+**Morte entre o commit e o ack:**
+1. Só o processo A roda, com o consumer apontado para o proxy.
+2. O teste espera o proxy reter o `DeleteMessage` de M. Nesse instante, o inbox de M já existe (COMMIT feito) e M está **em voo** na fila (`inFlight: 1`).
+3. `kill -9` em A.
+4. B sobe com o SQS direto, recebe M depois da visibilidade (2 s), o inbox acusa duplicata e B dá ack.
+
+**Provado:** uma linha de inbox, um lançamento, saldo exato, `wagering_duplicates_total{type="inbox"}` = 1 e nenhuma transação nova no `/metrics` de **B**, e os eventos da wallet publicados uma vez cada.
+
+**Morte antes do commit** (sem proxy): o teste trava a wallet por SQL, A grava o inbox (não confirmado) e fica esperando o lock. `kill -9` em A; o inbox de M continua vazio para quem está fora da transação. O teste solta o lock, e B aplica M uma vez.
+- **Detalhe do Postgres:** um backend esperando lock **não percebe** que o cliente morreu até conseguir o lock (`client_connection_check_interval` vem desligado). Só então ele tenta responder ao socket fechado e aborta a transação.
+- Em produção, isso é limitado por `DB_LOCK_TIMEOUT_MS`. Até lá, o INSERT do inbox desse backend segura uma reentrega da mesma mensagem, que espera e depois segue normalmente.
+
+**Publisher morto depois do aceite do SQS:** o proxy retém a resposta do `SendMessage`, e o teste confirma que o corpo enviado era o primeiro evento da wallet. Depois do `kill -9`, o COMMIT do publisher nunca acontece, e os eventos continuam pendentes. Outro processo os publica, a FIFO absorve o reenvio, e cada `eventId` chega uma vez.
+
+**SIGTERM real:**
+- O Nest fecha a app e reemite o sinal (`process.kill(process.pid, signal)`), então o processo termina **por SIGTERM** depois do shutdown limpo.
+- Com M1 esperando o lock da wallet (segurado pelo teste, `DB_LOCK_TIMEOUT_MS` de 10 s no processo) e M2 do mesmo grupo no lote: M1 é concluída e recebe ack, M2 volta visível na hora (< 1,5 s), o log tem "SQS consumer stopped" e não tem o aviso de grace estourado. Outro processo aplica M2.
+
+### D50. Prova de consistência depois do reinício
+
+**Roteiro** (`restart-consistency.test.ts`), com 12 wallets de 1000.00 e uma carga determinística:
+- por HTTP: 4 BETs de 5.00, 2 WINs de 3.00 e um REFUND de 7.00 cuja BET ainda não existe;
+- por SQS: 4 BETs de 2.00 e uma reentrega.
+
+Os passos:
+1. **Carga com falhas:** 3 processos com todos os laços recebem a carga. No meio dela, `kill -9` no 1 e SIGTERM no 2. O `FleetClient` reenvia o que falhou para o processo vivo.
+2. **Queda total:** `kill -9` no 3. O teste confirma que os 12 REFUNDs estão em PENDING_REFERENCE. As 12 BETs que eles esperam são enviadas por SQS **sem nenhum processo rodando**.
+3. **Reinício:** 3 processos novos sobem, e o resto da carga (2 BETs de 5.00 por wallet) é enviado.
+4. **Quiescência:** fila vazia (visíveis e em voo), REFUNDs liquidados e outbox sem pendentes.
+
+**Provas:**
+1. Todas as wallets reconciliadas pelo endpoint (`consistent: true`, saldo 968.00, 15 lançamentos), além do `assertAllWalletsMatchLedger` (saldo = Σ ledger = último `balance_after`, `version` = 1 + lançamentos).
+2. Cada `Idempotency-Key` enviada (HTTP e SQS) existe uma vez e PROCESSED.
+3. Cada `messageId` enviado tem exatamente uma linha no inbox, e a DLQ está vazia.
+4. O conjunto de `eventId` lido da fila de eventos é igual ao conjunto de ids do outbox das wallets, com zero duplicatas.
+
+**Medido** (linha do tempo impressa pelo teste):
+- 3 processos e 12 wallets prontos em 0,7 s;
+- `kill -9` aos 0,9 s e SIGTERM concluído aos 1,2 s;
+- carga respondida com 4 reenvios para outro processo;
+- queda total aos 1,9 s e 3 processos novos aos 2,6 s;
+- quiescência aos 4,3 s;
+- 372 eventos recebidos, 0 duplicatas, teste completo em ~7 s.
+
+### D51. Imagem, migrations e compose (P3, P4, P7)
+
+**Dockerfile** (multi-stage, `oven/bun:1.4.2-alpine`):
+- **`dependencies`:** `bun install --frozen-lockfile --production`.
+- **Runtime:** copia `node_modules`, `src`, `package.json` e **`tsconfig.json`**. O Bun lê o `tsconfig.json` para emitir a metadata dos decorators que o DI do Nest usa (seção 1), então ele precisa estar na imagem.
+- Roda com `NODE_ENV=production`, como o usuário não-root `bun`, com `CMD ["bun", "src/main.ts"]`.
+- Sem etapa de build (o Bun executa TypeScript); o typecheck fica no desenvolvimento.
+- A imagem tem 205 MB. O `.dockerignore` deixa de fora `.env*`, `test`, `docs`, `scripts` e `.git`.
+
+**Migrations:** `src/migrate.ts` roda `orm.migrator.up()` com as mesmas opções da app.
+- Usa `@mikro-orm/migrations`, que já é dependência de produção, então a CLI (devDependency) fica fora da imagem.
+- Roda no serviço one-shot `migrate`; as réplicas dependem dele com `service_completed_successfully` e não migram ao subir, o que evita corrida entre réplicas.
+
+**Compose** (profile `app`, para que o `docker compose up -d --wait` do desenvolvimento continue subindo só Postgres e SQS):
+- **`app`:** `deploy.replicas: ${APP_REPLICAS:-3}` e `ports: "${APP_PORTS:-3001-3003}:3000"`, uma porta do host por réplica.
+- **Rede:** `env_file: .env`, com `DB_HOST=postgres`, `DB_PORT=5432` e `SQS_ENDPOINT=http://sqs:4566` sobrescritos para a rede interna.
+- **Sinais:** `init: true` (tini: repassa o SIGTERM e recolhe zumbis) e `stop_grace_period: 25s`, acima dos graces de 10 s do consumer e dos workers.
+- **Healthcheck:** `wget` no `/health/ready`.
+- **Faixa de portas, sem balanceador (P3):** dá para mirar uma réplica específica, por exemplo para mandar a mesma aposta a duas réplicas.
+
+**Medido:**
+- do zero (`down -v`), `docker compose --profile app up -d --build --wait` retornou em 26 s, com as 7 migrations aplicadas e 3 réplicas healthy;
+- `docker compose --profile app stop app` levou de 0,7 a 1,3 s, com cada réplica registrando consumer, publisher e worker parados e saindo com 143 (SIGTERM).
+
+### D52. Papéis das réplicas (P2)
+
+| Opção | Resultado |
+|---|---|
+| **Toda réplica roda HTTP, consumer, publisher e worker (escolhida)** | Simétrico e simples; é o cenário "3+ instâncias" do enunciado, com 3 consumers, 3 publishers e 3 workers disputando; o pool de 10 por réplica comporta (5 + 1 + 1 em segundo plano, 3 para o HTTP; D40), e são 30 conexões no total |
+| Serviços por papel com as flags existentes (`api` com as flags em `false`; `worker` com os laços) | Escala independente, mas são mais serviços sem pedido do enunciado, e o `worker` continua com HTTP para health e métricas |
+| Nova variável `APP_ROLE` | Redundante com as três flags |
+
+A separação por papel é a evolução natural e não exige código: são dois serviços no compose com flags diferentes.
+
+### D53. Verificação pelo avaliador (P8)
+
+`bun run verify:replicas` (`scripts/verify-replicas.ts`, portas em `REPLICA_PORTS`, padrão `3001,3002,3003`):
+- confere o `/health/ready` de cada réplica;
+- manda a mesma aposta 30× espalhada;
+- roda a seção 8 com as apostas em réplicas diferentes;
+- publica 30 mensagens (mais uma reentrega) na fila e espera os saldos;
+- espera o outbox zerar (gauge de cada réplica);
+- reconcilia todas as wallets tocadas, alternando réplicas;
+- imprime o trabalho de cada réplica a partir do `/metrics` dela e sai com código ≠ 0 em qualquer falha.
+
+A distribuição entre réplicas é **informativa**, não um critério de falha: a FIFO entrega grupos a quem estiver fazendo polling. Se as réplicas processaram menos mensagens do que foram enviadas, o script avisa que houve consumo fora delas. Isso aconteceu na validação, com um `bun run dev` no host ligado à mesma fila (11 de 30).
+
+**Validado do zero:** `docker compose --profile app down -v`, os passos da seção "Rodando várias instâncias" do README como escritos, e `verify:replicas` com todas as verificações ok.
+
+## 11. Autenticação
 
 Fora do escopo implementado; a seção 2 do enunciado aceita essa decisão. O desenho que adotaríamos:
 - **IdP externo (Keycloak, OIDC).** Cada provedor de jogos é um client confidencial e obtém token via *client credentials*.
 - A API valida o JWT localmente (assinatura via JWKS em cache, `iss`, `aud`, `exp`). Um claim `provider_id` precisa ser igual ao `providerId` do corpo, senão a resposta é 403. Isso impede um provedor de submeter transações em nome de outro.
 - **Ponto de extensão no código:** `AuthGuard` no-op (`src/interfaces/http/auth/auth.guard.ts`), aplicado com `@UseGuards` no `WalletsController`, no `WageringController` e no `ProviderTransactionsController`. Um teste confere que ele está registrado. Os endpoints de health ficam abertos. A fila SQS é tratada como canal interno confiável, mas o `providerId` da mensagem passa pelas mesmas validações de domínio.
 
-## 11. Limitações conhecidas
+## 12. Limitações conhecidas
 
 - A LocalStack 4.14.0 está congelada e não recebe correções. Se a tag deixar de existir ou aparecer uma divergência de comportamento, a saída é o MiniStack (D1).
-- A aplicação ainda roda no host. O Dockerfile e o serviço `app` com réplicas entram na Etapa 6.
+- Os testes multiprocesso rodam a aplicação como processos do host, não como contêineres. A imagem é exercitada pelo `verify:replicas`, que não faz parte do `bun test` (D48, D53).
+- Se o runner de testes for morto com `kill -9` no meio de `test/multiprocess`, os processos filhos podem sobrar; o README traz o `pkill` pelo marcador (D48).
+- As réplicas do compose e um `bun run dev` no host usam o mesmo banco e as mesmas filas padrão; rodando juntos, dividem o consumo (D53).
+- Um backend do Postgres esperando lock não percebe que o cliente morreu até conseguir o lock (`client_connection_check_interval` vem desligado). A transação do processo morto só é desfeita depois disso, o que é limitado por `DB_LOCK_TIMEOUT_MS` (D49).
 - Sem TLS entre a aplicação e as dependências locais (ambiente de desenvolvimento).
 - A app conecta como dono das tabelas. A imutabilidade não depende disso (triggers valem para todos), mas um role com privilégios mínimos seria a defesa em profundidade em produção (D20).
 - O `correlationId` não aparece no problem de JSON malformado, porque o parser de corpo roda antes do middleware de log que atribui o id.

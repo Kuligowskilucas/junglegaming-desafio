@@ -2,7 +2,7 @@
 
 Serviço financeiro distribuído que processa transações de apostas (BET, WIN, LOSS, REFUND, ROLLBACK) de múltiplos provedores, com idempotência persistente, ledger imutável e transactional outbox. O enunciado completo está em [`docs/DESAFIO.md`](docs/DESAFIO.md). As decisões técnicas e os trade-offs estão em [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
-**Status:** Etapas 1 a 5 e 6a concluídas: infra local, aplicação NestJS em Bun, config validada, logs JSON, health checks; o modelo de domínio (Money, Wallet, ledger, WagerTransaction, regras de BET/WIN/LOSS/REFUND/ROLLBACK, inbox, outbox e eventos); o schema PostgreSQL com as garantias no banco (constraints, índices e triggers), a persistência, os endpoints de wallet, a submissão de transações com idempotência, lock por wallet e outbox, testada com concorrência real; o consumer SQS com inbox, ack após o commit, backoff, DLQ e shutdown limpo; o publisher do outbox (várias instâncias, ordem por wallet, retry) e o worker que resolve as transações em PENDING_REFERENCE; e a reconciliação de wallet, as métricas Prometheus e a revisão dos logs.
+**Status:** Etapas 1 a 6 concluídas: infra local, aplicação NestJS em Bun, config validada, logs JSON, health checks; o modelo de domínio (Money, Wallet, ledger, WagerTransaction, regras de BET/WIN/LOSS/REFUND/ROLLBACK, inbox, outbox e eventos); o schema PostgreSQL com as garantias no banco (constraints, índices e triggers), a persistência, os endpoints de wallet, a submissão de transações com idempotência, lock por wallet e outbox, testada com concorrência real; o consumer SQS com inbox, ack após o commit, backoff, DLQ e shutdown limpo; o publisher do outbox (várias instâncias, ordem por wallet, retry) e o worker que resolve as transações em PENDING_REFERENCE; a reconciliação de wallet, as métricas Prometheus e a revisão dos logs; e os testes com processos reais (3+ instâncias, `kill -9`, SIGTERM e reinício), a imagem Docker e as réplicas no compose.
 
 ## Pré-requisitos
 
@@ -37,6 +37,56 @@ docker compose exec sqs sh -c 'awslocal sqs get-queue-attributes --attribute-nam
   --queue-url "$(awslocal sqs get-queue-url --queue-name wager-transactions.fifo --query QueueUrl --output text)"'
 ```
 
+## Rodando várias instâncias (Docker)
+
+A imagem da aplicação e as réplicas ficam no profile `app` do compose, então o `docker compose up -d --wait` do setup acima continua subindo só Postgres e SQS. Com o profile, sobem também:
+- um serviço `migrate`, que aplica as migrations uma vez e termina;
+- **3 réplicas**, cada uma com HTTP, consumer, publisher e worker, expostas nas portas **3001, 3002 e 3003**.
+
+Do zero, num clone novo:
+
+```bash
+cp .env.example .env
+bun install --frozen-lockfile                        # o script de verificação usa o SDK do SQS
+docker compose --profile app up -d --build --wait    # retorna com postgres, sqs e as 3 réplicas healthy
+docker compose --profile app ps                      # 3 linhas "app" healthy, nas portas 3001–3003
+bun run verify:replicas
+```
+
+O `verify:replicas` (`scripts/verify-replicas.ts`):
+1. confere o `/health/ready` de cada réplica;
+2. manda a mesma aposta 30 vezes, espalhada entre as réplicas (um débito só);
+3. roda o cenário da seção 8 com as duas apostas em réplicas diferentes;
+4. publica 30 mensagens na fila (mais uma reentrega) e espera o processamento;
+5. confere que o outbox foi todo publicado;
+6. reconcilia todas as wallets tocadas, alternando as réplicas.
+
+No fim, imprime o trabalho de cada réplica (lido do `/metrics` de cada uma) e sai com código ≠ 0 se qualquer verificação falhar. Exemplo de saída:
+
+```
+ok    replica 1 (:3001) is ready
+…
+ok    16 wallets reconciled across the replicas, all consistent
+
+Work per replica (from each replica's /metrics):
+  replica 1 (:3001): 11 HTTP transactions, 9 SQS transactions in this run, 4 events published, 9 duplicates detected
+  …
+All checks passed.
+```
+
+Manualmente:
+
+```bash
+for port in 3001 3002 3003; do curl -s localhost:$port/health/ready; echo; done
+docker compose --profile app logs app | grep '"Wager transaction message handled"'   # o prefixo mostra qual réplica processou
+docker compose --profile app stop app      # SIGTERM: cada réplica conclui o trabalho em andamento e sai
+docker compose --profile app down          # remove as réplicas e mantém o volume do Postgres
+```
+
+Para outra quantidade de réplicas, ajuste o número e a faixa de portas juntos: `APP_REPLICAS=5 APP_PORTS=3001-3005 docker compose --profile app up -d --wait` (e `REPLICA_PORTS=3001,3002,3003,3004,3005 bun run verify:replicas`).
+
+As réplicas usam o banco `wagering` e as filas padrão, as mesmas de um `bun run dev`. Com os dois rodando, ambos consomem a mesma fila, e o resumo do verify avisa quantas mensagens foram processadas fora das réplicas.
+
 ## Comandos
 
 | Comando | O que faz |
@@ -50,6 +100,9 @@ docker compose exec sqs sh -c 'awslocal sqs get-queue-attributes --attribute-nam
 | `bun run test:unit` | Só os testes sem I/O (domínio, arquitetura, config) |
 | `bun run test:integration` | Só os testes contra Postgres e SQS reais |
 | `bun run test:concurrency` | Só os cenários com paralelismo real (seção 8, mesma aposta 50×, wallet quente, reversões simultâneas) |
+| `bun run test:multiprocess` | Só os testes com processos reais da aplicação (3+ instâncias, `kill -9`, SIGTERM, reinício); ~33 s |
+| `docker compose --profile app up -d --build --wait` | Builda a imagem, aplica as migrations e sobe 3 réplicas (portas 3001–3003) |
+| `bun run verify:replicas` | Verifica as réplicas de ponta a ponta (ver "Rodando várias instâncias") |
 | `bun run db:migrate` | Aplica as migrations pendentes (7: wallets, transações, ledger, coerência, inbox, outbox, ordem do outbox e correlação) |
 | `bun run db:migrate:down` | Reverte a última migration |
 | `bun run db:migration:create` | Cria uma migration em branco (SQL escrito à mão) |
@@ -171,6 +224,14 @@ Com várias instâncias, some contadores e use `max` nos gauges, que são consul
 - **Consumer SQS** (`test/integration/sqs`): cada teste cria um par de filas FIFO próprio, com visibilidade curta, e cobre redelivery, crash entre commit e ack, retry transitório, DLQ, ordem por grupo e shutdown.
 - **Reconciliação, métricas e logs** (`test/integration/http/reconciliation.test.ts`, `test/integration/application/reconcile-wallet.test.ts`, `test/integration/observability`): a divergência é provocada desligando os triggers só na transação do teste (`SET LOCAL session_replication_role = replica`, o usuário do container é superusuário) e restaurada no fim; um teste determinístico confirma uma BET entre as duas leituras da reconciliação para provar o snapshot; as métricas são conferidas pelo `/metrics` real; os logs são capturados de um destino comum aos testes e varridos atrás de valores-canário, chaves proibidas e chaves duplicadas.
 - **Publisher e worker** (`test/integration/workers`): cada teste do publisher usa uma fila de eventos própria e cobre dois publishers simultâneos (ordem por wallet, sem envio duplicado), instância morta antes de publicar, envio sem marcação absorvido pela deduplicação da FIFO, retry com backoff e evento em backoff segurando os seguintes da wallet. Os do worker cobrem REFUND antes da BET, ROLLBACK antes do WIN, o empurrão, novas tentativas, limite esgotado, replay, concorrência com o HTTP e dois workers.
+- **Processos reais** (`test/multiprocess`, ~33 s): cada teste sobe a aplicação como processos do sistema operacional (`bun src/main.ts`, o mesmo entrypoint da produção) em portas livres, com o env do cenário, e espera o `/health/ready`. Os cenários:
+  - 3 instâncias recebendo a mesma aposta e a seção 8 divididas entre elas;
+  - consumers de 3 processos na mesma fila e publishers de 2 processos;
+  - `kill -9` entre o commit e o ack, antes do commit e no meio da publicação;
+  - SIGTERM real com mensagem em andamento;
+  - reinício depois de `kill -9`, SIGTERM e queda total, com a prova de consistência final.
+
+  A janela entre o commit e o ack é acertada por um proxy de teste entre o processo e o LocalStack (`test/support/sqs-fault-proxy.ts`), que segura o `DeleteMessage`; a aplicação não tem gancho para isso. Os processos são encerrados no `afterEach` e na saída do runner. Os logs de cada um ficam em `$TMPDIR/wagering-multiprocess/<execução>/`.
 - **Concorrência** (`test/concurrency`): requisições HTTP em paralelo contra o Postgres real. O cliente reenvia ao receber 503, respeitando o `Retry-After`, e cada cenário registra quantos 503 recebeu (resumo no fim da execução). Depois de cada teste, todas as wallets são conferidas contra o ledger. O `.env.test` usa `DB_POOL_MAX=20` para haver paralelismo real no banco.
 - **Limpeza sem desligar triggers:** os arquivos que usam tabelas chamam `resetDatabase()`, que derruba e recria o schema (`DROP SCHEMA` + migrations) dentro do lock. O ledger é imutável e nem os testes apagam linhas dele. O reset recusa bancos cujo nome não termine em `_test`.
 
@@ -214,3 +275,5 @@ Toda a configuração vem de variáveis de ambiente, validadas na subida. Com al
 - **Porta 5432 ou 5433 ocupada:** troque `DB_PORT` no `.env`.
 - **O banco `wagering_test` não existe:** o init do Postgres só roda com o volume vazio. Rode `docker compose down -v && docker compose up -d --wait`.
 - **Logs legíveis no terminal:** `bun run dev | bunx pino-pretty`.
+- **Processos de teste órfãos** (só se o runner for morto com `kill -9` no meio de `test/multiprocess`): `pkill -f -- --wagering-test-instance`. O marcador só existe na linha de comando dos processos dos testes, então `bun run dev`, `bun run start` e as réplicas do compose não são afetados.
+- **Portas 3001–3003 ocupadas para as réplicas:** use outra faixa, por exemplo `APP_PORTS=4001-4003 docker compose --profile app up -d --wait` e `REPLICA_PORTS=4001,4002,4003 bun run verify:replicas`.

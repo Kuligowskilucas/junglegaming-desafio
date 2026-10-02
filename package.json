@@ -14,6 +14,7 @@
     "test": "bun test",
     "test:unit": "bun test test/unit",
     "test:integration": "bun test test/integration",
+    "test:concurrency": "bun test test/concurrency",
     "db:migrate": "bun ./node_modules/@mikro-orm/cli/cli.js migration:up",
     "db:migrate:down": "bun ./node_modules/@mikro-orm/cli/cli.js migration:down",
     "db:migration:create": "bun ./node_modules/@mikro-orm/cli/cli.js migration:create --blank",

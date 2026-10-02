@@ -38,6 +38,7 @@ describe("AppConfig.fromEnv", () => {
       password: "wagering",
       name: "wagering",
       poolMax: 10,
+      lockTimeoutMs: 2000,
     });
     expect(config.sqs).toEqual({
       region: "us-east-1",

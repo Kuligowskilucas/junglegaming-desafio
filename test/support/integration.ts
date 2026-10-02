@@ -4,13 +4,13 @@ import { SQL, type ReservedSQL } from "bun";
 import { AppConfig } from "../../src/infrastructure/config/app-config";
 
 const integrationTestsLockKey = 4_271_001;
-const lockWaitTimeoutMs = 300_000;
+const lockWaitTimeoutMs = 600_000;
 const preflightTimeoutMs = 3_000;
 const infrastructureHint = "rode `docker compose up -d --wait` antes dos testes de integração";
 const integrationTestTimeoutMs = 30_000;
 
-export function useIntegrationEnvironment(): void {
-  setDefaultTimeout(integrationTestTimeoutMs);
+export function useIntegrationEnvironment(options: { testTimeoutMs?: number } = {}): void {
+  setDefaultTimeout(options.testTimeoutMs ?? integrationTestTimeoutMs);
   let pool: SQL | undefined;
   let lockConnection: ReservedSQL | undefined;
 

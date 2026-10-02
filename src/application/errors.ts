@@ -74,3 +74,24 @@ export class WagerTransactionNotFoundError extends ApplicationError {
     super("TRANSACTION_NOT_FOUND", `Transaction ${lookup} does not exist`);
   }
 }
+
+export class DuplicateInboxMessageError extends ApplicationError {
+  constructor(
+    readonly consumerName: string,
+    readonly messageId: string,
+  ) {
+    super("DUPLICATE_INBOX_MESSAGE", `Message ${messageId} was already handled by ${consumerName}`);
+  }
+}
+
+export class InboxPayloadMismatchError extends ApplicationError {
+  constructor(
+    readonly consumerName: string,
+    readonly messageId: string,
+  ) {
+    super(
+      "INBOX_PAYLOAD_MISMATCH",
+      `Message ${messageId} was already handled by ${consumerName} with a different payload`,
+    );
+  }
+}

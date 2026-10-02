@@ -21,8 +21,20 @@ const envSchema = z.object({
   SQS_ENDPOINT: z.url().optional(),
   SQS_WAGER_QUEUE_NAME: z.string().endsWith(".fifo"),
   SQS_WAGER_DLQ_NAME: z.string().endsWith(".fifo"),
+  SQS_CONSUMER_ENABLED: z.enum(["true", "false"]).default("false"),
+  SQS_CONSUMER_NAME: z.string().min(1).max(128).default("wager-transactions-consumer"),
+  SQS_WAIT_TIME_SECONDS: z.coerce.number().int().min(0).max(20).default(20),
+  SQS_MAX_MESSAGES: z.coerce.number().int().min(1).max(10).default(10),
+  SQS_CONSUMER_CONCURRENCY: positiveInt.optional(),
+  SQS_RETRY_BASE_SECONDS: positiveInt.default(2),
+  SQS_RETRY_MAX_SECONDS: positiveInt.max(43_200).default(300),
+  SQS_SHUTDOWN_GRACE_MS: positiveInt.default(10_000),
   HEALTH_CHECK_TIMEOUT_MS: positiveInt.default(1000),
 });
+
+function consumerConcurrency(vars: z.infer<typeof envSchema>): number {
+  return vars.SQS_CONSUMER_CONCURRENCY ?? Math.max(1, Math.floor(vars.DB_POOL_MAX / 2));
+}
 
 export class InvalidConfigError extends Error {
   constructor(readonly issues: readonly string[]) {
@@ -49,6 +61,16 @@ export class AppConfig {
       endpoint: string | undefined;
       wagerQueueName: string;
       wagerDeadLetterQueueName: string;
+      consumer: Readonly<{
+        enabled: boolean;
+        name: string;
+        waitTimeSeconds: number;
+        maxMessages: number;
+        concurrency: number;
+        retryBaseSeconds: number;
+        retryMaxSeconds: number;
+        shutdownGraceMs: number;
+      }>;
     }>,
     readonly health: Readonly<{ timeoutMs: number }>,
   ) {
@@ -63,6 +85,12 @@ export class AppConfig {
       );
     }
     const vars = result.data;
+    const concurrency = consumerConcurrency(vars);
+    if (vars.SQS_CONSUMER_ENABLED === "true" && concurrency >= vars.DB_POOL_MAX) {
+      throw new InvalidConfigError([
+        `SQS_CONSUMER_CONCURRENCY: must be lower than DB_POOL_MAX (${vars.DB_POOL_MAX}) to keep connections for the API, got ${concurrency}`,
+      ]);
+    }
     return new AppConfig(
       Object.freeze({ port: vars.HTTP_PORT }),
       Object.freeze({ level: vars.LOG_LEVEL }),
@@ -80,6 +108,16 @@ export class AppConfig {
         endpoint: vars.SQS_ENDPOINT,
         wagerQueueName: vars.SQS_WAGER_QUEUE_NAME,
         wagerDeadLetterQueueName: vars.SQS_WAGER_DLQ_NAME,
+        consumer: Object.freeze({
+          enabled: vars.SQS_CONSUMER_ENABLED === "true",
+          name: vars.SQS_CONSUMER_NAME,
+          waitTimeSeconds: vars.SQS_WAIT_TIME_SECONDS,
+          maxMessages: vars.SQS_MAX_MESSAGES,
+          concurrency,
+          retryBaseSeconds: vars.SQS_RETRY_BASE_SECONDS,
+          retryMaxSeconds: vars.SQS_RETRY_MAX_SECONDS,
+          shutdownGraceMs: vars.SQS_SHUTDOWN_GRACE_MS,
+        }),
       }),
       Object.freeze({ timeoutMs: vars.HEALTH_CHECK_TIMEOUT_MS }),
     );

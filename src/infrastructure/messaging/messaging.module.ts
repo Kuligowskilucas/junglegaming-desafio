@@ -3,6 +3,7 @@ import { Module, type OnApplicationShutdown } from "@nestjs/common";
 import { AppConfig } from "../config/app-config";
 import { QueueUrlResolver } from "./queue-url-resolver";
 import { SqsHealth } from "./sqs-health";
+import { SqsQueueGateway } from "./sqs-queue-gateway";
 
 @Module({
   providers: [
@@ -14,8 +15,9 @@ import { SqsHealth } from "./sqs-health";
     },
     QueueUrlResolver,
     SqsHealth,
+    SqsQueueGateway,
   ],
-  exports: [SQSClient, QueueUrlResolver, SqsHealth],
+  exports: [SQSClient, QueueUrlResolver, SqsHealth, SqsQueueGateway],
 })
 export class MessagingModule implements OnApplicationShutdown {
   constructor(private readonly client: SQSClient) {}

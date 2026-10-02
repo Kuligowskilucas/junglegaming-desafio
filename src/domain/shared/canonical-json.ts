@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 export type CanonicalJsonValue = string | { readonly [key: string]: CanonicalJsonValue | undefined };
 
 export function canonicalJson(value: CanonicalJsonValue): string {
@@ -11,4 +13,8 @@ export function canonicalJson(value: CanonicalJsonValue): string {
       return member === undefined ? [] : [`${JSON.stringify(key)}:${canonicalJson(member)}`];
     });
   return `{${members.join(",")}}`;
+}
+
+export function canonicalHash(value: CanonicalJsonValue): string {
+  return createHash("sha256").update(canonicalJson(value), "utf8").digest("hex");
 }

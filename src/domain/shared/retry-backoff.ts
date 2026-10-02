@@ -3,7 +3,10 @@ export interface BackoffPolicy {
   readonly maxDelayMs: number;
 }
 
+export function backoffDelayMs(policy: BackoffPolicy, attempt: number): number {
+  return Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** (attempt - 1));
+}
+
 export function nextAttemptAt(policy: BackoffPolicy, attempt: number, now: Date): Date {
-  const delayMs = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** (attempt - 1));
-  return new Date(now.getTime() + delayMs);
+  return new Date(now.getTime() + backoffDelayMs(policy, attempt));
 }

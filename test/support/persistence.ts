@@ -63,6 +63,7 @@ export async function applyTransaction(
       providerId: "provider-a",
       externalTransactionId,
       idempotencyKey: `provider-a:${externalTransactionId}`,
+      correlationId: "test",
       playerId: wallet.playerId,
       walletId: wallet.id,
       roundId: options.reference?.roundId ?? "round-1",

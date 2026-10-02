@@ -52,12 +52,12 @@ describe("deferred coherence between wallet, ledger and transaction", () => {
     return sql.begin(async (tx) => {
       await tx`
         INSERT INTO wager_transactions (
-          id, provider_id, external_transaction_id, idempotency_key, payload_hash, wallet_id, player_id, round_id,
+          id, provider_id, external_transaction_id, idempotency_key, correlation_id, payload_hash, wallet_id, player_id, round_id,
           game_id, kind, amount, currency, reference_external_transaction_id, status, reference_transaction_id,
           failure_code, observed_balance, reference_attempts, next_reference_attempt_at, created_at, updated_at,
           processed_at
         ) VALUES (
-          ${transactionId}, 'provider-a', ${externalId}, ${`provider-a:${externalId}`}, ${"b".repeat(64)},
+          ${transactionId}, 'provider-a', ${externalId}, ${`provider-a:${externalId}`}, 'correlation-test', ${"b".repeat(64)},
           ${movement.wallet.id}, ${movement.wallet.playerId}, ${reference?.roundId ?? "round-1"}, 'fortune-chimp',
           ${movement.kind}, ${movement.transactionAmount ?? movement.amount}, ${movement.transactionCurrency ?? "BRL"},
           ${reference?.externalTransactionId ?? null}, ${status},

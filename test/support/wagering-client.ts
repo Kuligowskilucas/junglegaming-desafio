@@ -69,13 +69,18 @@ export class WageringClient {
     return { id: ((await response.json()) as { id: string }).id, playerId };
   }
 
-  async submit(payload: unknown, idempotencyKey: string | undefined): Promise<SubmissionResponse> {
+  async submit(
+    payload: unknown,
+    idempotencyKey: string | undefined,
+    headers: Record<string, string> = {},
+  ): Promise<SubmissionResponse> {
     for (let attempt = 1; ; attempt += 1) {
       const response = await fetch(`${this.baseUrl}/wagering/transactions`, {
         method: "POST",
         headers: {
           "content-type": "application/json",
           ...(idempotencyKey === undefined ? {} : { "idempotency-key": idempotencyKey }),
+          ...headers,
         },
         body: JSON.stringify(payload),
       });
@@ -89,8 +94,13 @@ export class WageringClient {
     }
   }
 
-  submitWager(payload: WagerPayload): Promise<SubmissionResponse> {
-    return this.submit(payload, keyOf(payload));
+  submitWager(payload: WagerPayload, headers: Record<string, string> = {}): Promise<SubmissionResponse> {
+    return this.submit(payload, keyOf(payload), headers);
+  }
+
+  async transaction(providerId: string, externalTransactionId: string): Promise<Record<string, unknown> | undefined> {
+    const response = await fetch(`${this.baseUrl}/providers/${providerId}/wagering/transactions/${externalTransactionId}`);
+    return response.status === 200 ? ((await response.json()) as Record<string, unknown>) : undefined;
   }
 
   async balanceOf(walletId: string): Promise<string> {

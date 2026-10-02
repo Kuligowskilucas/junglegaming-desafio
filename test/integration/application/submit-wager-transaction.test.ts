@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { MikroORM } from "@mikro-orm/postgresql";
 import type { SQL } from "bun";
 import { DuplicateExternalTransactionError, IdempotencyConflictError } from "../../../src/application/errors";
+import { SettleAndRecord } from "../../../src/application/wagering/settle-and-record";
 import {
   type SubmitWagerTransactionCommand,
   SubmitWagerTransaction,
@@ -35,14 +36,15 @@ describe("SubmitWagerTransaction when the unique index catches a duplicate", () 
 
   const useCase = (transactions = repositories(orm).transactions) => {
     const repos = repositories(orm);
+    const clock = new SystemClock();
+    const ids = new UuidV7IdGenerator();
     return new SubmitWagerTransaction(
       repos.wallets,
       transactions,
-      repos.ledger,
-      repos.outbox,
+      new SettleAndRecord(repos.wallets, transactions, repos.ledger, repos.outbox, clock, ids),
       repos.runner,
-      new SystemClock(),
-      new UuidV7IdGenerator(),
+      clock,
+      ids,
     );
   };
 

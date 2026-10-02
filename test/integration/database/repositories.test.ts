@@ -185,7 +185,7 @@ describe("MikroORM repositories and mappers", () => {
     expect(opening.providerId).toBe("internal");
     expect(opening.observedBalance?.toJSON().amount).toBe("42.00");
     expect(opening.payloadHash).toBe(
-      WagerTransaction.opening({ id: opening.id, walletId: wallet.id, playerId: wallet.playerId, money: brl("42.00"), at }).payloadHash,
+      WagerTransaction.opening({ id: opening.id, correlationId: "test", walletId: wallet.id, playerId: wallet.playerId, money: brl("42.00"), at }).payloadHash,
     );
   });
 });

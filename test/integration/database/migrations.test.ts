@@ -69,6 +69,8 @@ describe("migrations", () => {
         "wallet_ledger_entries_wallet_version_key",
         "inbox_messages_pkey",
         "outbox_messages_payload_envelope",
+        "outbox_messages_ordering_key_bounds",
+        "wager_transactions_correlation_id_bounds",
       ]),
     );
     expect(afterFirstUp.indexes).toEqual(
@@ -76,6 +78,8 @@ describe("migrations", () => {
         "wager_transactions_one_reversal_per_reference",
         "wager_transactions_pending_reference_due",
         "outbox_messages_pending_due",
+        "outbox_messages_pending_by_ordering_key",
+        "wager_transactions_waiting_for_reference",
       ]),
     );
     expect(afterFirstUp.triggers).toEqual([
@@ -92,7 +96,7 @@ describe("migrations", () => {
     ]);
 
     const executed = await orm.migrator.getExecuted();
-    expect(executed).toHaveLength(6);
+    expect(executed).toHaveLength(7);
 
     for (let remaining = executed.length - 1; remaining >= 0; remaining -= 1) {
       await orm.migrator.down();

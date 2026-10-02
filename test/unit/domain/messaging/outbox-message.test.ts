@@ -20,6 +20,8 @@ describe("OutboxMessage.enqueue", () => {
 
     expect(message.id).toBe("event-1");
     expect(message.aggregateId).toBe("wallet-1");
+    expect(message.orderingKey).toBe("wallet-1");
+    expect(message.position).toBeUndefined();
     expect(message.eventType).toBe("WalletBalanceChanged");
     expect(message.occurredAt).toEqual(at);
     expect(message.payload).toMatchObject({ eventId: "event-1", eventType: "WalletBalanceChanged", version: 1 });
@@ -85,6 +87,8 @@ describe("OutboxMessage delivery", () => {
     const message = OutboxMessage.rehydrate({
       id: "event-9",
       aggregateId: "wallet-1",
+      orderingKey: "wallet-1",
+      position: 9,
       eventType: "WalletBalanceChanged",
       payload: { eventId: "event-9" },
       occurredAt: at,

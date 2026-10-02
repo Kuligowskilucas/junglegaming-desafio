@@ -40,6 +40,7 @@ export function aTransaction(
     providerId,
     externalTransactionId,
     idempotencyKey: `${providerId}:${externalTransactionId}`,
+    correlationId: "correlation-1",
     playerId: "player-1",
     walletId: "wallet-1",
     roundId: "round-1",

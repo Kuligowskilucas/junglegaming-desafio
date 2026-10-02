@@ -45,6 +45,7 @@ describe("AppConfig.fromEnv", () => {
       endpoint: "http://localhost:4566",
       wagerQueueName: "wager-transactions.fifo",
       wagerDeadLetterQueueName: "wager-transactions-dlq.fifo",
+      eventsQueueName: "wager-events.fifo",
       consumer: {
         enabled: false,
         name: "wager-transactions-consumer",
@@ -56,6 +57,15 @@ describe("AppConfig.fromEnv", () => {
         shutdownGraceMs: 10_000,
       },
     });
+    expect(config.outbox).toEqual({
+      publisherEnabled: false,
+      pollIntervalMs: 500,
+      batchOrderingKeys: 20,
+      batchMessagesPerOrderingKey: 50,
+      publishTimeoutMs: 5_000,
+    });
+    expect(config.referenceWorker).toEqual({ enabled: false, pollIntervalMs: 1_000, batchSize: 50 });
+    expect(config.workers.shutdownGraceMs).toBe(10_000);
     expect(config.health.timeoutMs).toBe(1000);
   });
 
@@ -89,10 +99,27 @@ describe("AppConfig.fromEnv", () => {
     expect(AppConfig.fromEnv({ ...validEnv, SQS_CONSUMER_CONCURRENCY: "7" }).sqs.consumer.concurrency).toBe(7);
   });
 
-  test("refuses a consumer that could take every connection from the API", () => {
-    const issues = issuesOf({ ...validEnv, SQS_CONSUMER_ENABLED: "true", DB_POOL_MAX: "4", SQS_CONSUMER_CONCURRENCY: "4" });
+  test("refuses background work that could take every connection from the API", () => {
+    const consumerOnly = issuesOf({ ...validEnv, SQS_CONSUMER_ENABLED: "true", DB_POOL_MAX: "4", SQS_CONSUMER_CONCURRENCY: "4" });
+    const everything = issuesOf({
+      ...validEnv,
+      DB_POOL_MAX: "4",
+      SQS_CONSUMER_ENABLED: "true",
+      OUTBOX_PUBLISHER_ENABLED: "true",
+      REFERENCE_WORKER_ENABLED: "true",
+    });
 
-    expect(issues).toEqual([expect.stringMatching(/^SQS_CONSUMER_CONCURRENCY: must be lower than DB_POOL_MAX/)]);
+    expect(consumerOnly).toEqual([expect.stringMatching(/^DB_POOL_MAX: background work needs 4 connection/)]);
+    expect(everything).toEqual([expect.stringMatching(/^DB_POOL_MAX: background work needs 4 connection/)]);
+    expect(
+      AppConfig.fromEnv({
+        ...validEnv,
+        DB_POOL_MAX: "10",
+        SQS_CONSUMER_ENABLED: "true",
+        OUTBOX_PUBLISHER_ENABLED: "true",
+        REFERENCE_WORKER_ENABLED: "true",
+      }).sqs.consumer.concurrency,
+    ).toBe(5);
   });
 
   test("rejects out-of-range ports", () => {

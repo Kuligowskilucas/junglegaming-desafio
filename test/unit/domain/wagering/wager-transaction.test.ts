@@ -67,7 +67,7 @@ describe("WagerTransaction.create", () => {
     expect(creationFailureOf(kind, overrides)).toBe(reason);
   });
 
-  test.each(["id", "providerId", "externalTransactionId", "idempotencyKey", "playerId", "walletId", "roundId", "gameId"])(
+  test.each(["id", "providerId", "externalTransactionId", "idempotencyKey", "correlationId", "playerId", "walletId", "roundId", "gameId"])(
     "rejects a blank %s",
     (field) => {
       expect(creationFailureOf(Bet, { [field]: " " })).toBe("BLANK_FIELD");
@@ -85,6 +85,7 @@ describe("WagerTransaction.opening", () => {
   test("is created already PROCESSED with reserved internal identifiers", () => {
     const opening = WagerTransaction.opening({
       id: "tx-opening",
+      correlationId: "correlation-1",
       walletId: "wallet-1",
       playerId: "player-1",
       money: brl("1000.00"),
@@ -101,11 +102,12 @@ describe("WagerTransaction.opening", () => {
     expect(opening.observedBalance?.toJSON().amount).toBe("1000.00");
     expect(opening.processedAt).toEqual(at);
     expect(opening.payloadHash).toBe(hashWagerPayload(opening));
+    expect(opening.correlationId).toBe("correlation-1");
   });
 
   test("requires a positive amount", () => {
     expect(() =>
-      WagerTransaction.opening({ id: "tx-opening", walletId: "wallet-1", playerId: "player-1", money: brl("0.00"), at }),
+      WagerTransaction.opening({ id: "tx-opening", correlationId: "c", walletId: "wallet-1", playerId: "player-1", money: brl("0.00"), at }),
     ).toThrow(InvalidOperationError);
   });
 });
@@ -270,7 +272,7 @@ describe("ledgerDirectionFor", () => {
   test("REFUND and OPENING are credits", () => {
     expect(aReversalOf(Refund, aTransaction(Bet)).ledgerDirectionFor(aTransaction(Bet))).toBe(LedgerDirection.Credit);
     expect(
-      WagerTransaction.opening({ id: "o", walletId: "w", playerId: "p", money: brl("1.00"), at }).ledgerDirectionFor(),
+      WagerTransaction.opening({ id: "o", correlationId: "c", walletId: "w", playerId: "p", money: brl("1.00"), at }).ledgerDirectionFor(),
     ).toBe(LedgerDirection.Credit);
   });
 
@@ -362,6 +364,7 @@ describe("WagerTransaction.rehydrate", () => {
   test("rebuilds a terminal transaction as persisted, without revalidating it", () => {
     const rejected = WagerTransaction.rehydrate({
       id: "tx-9",
+      correlationId: "correlation-9",
       providerId: "provider-a",
       externalTransactionId: "bet-9",
       idempotencyKey: "provider-a:bet-9",

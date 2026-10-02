@@ -171,3 +171,87 @@ export async function waitUntil(
   }
   throw new Error(`Timed out waiting for ${options.description}`);
 }
+
+export interface EventsQueue {
+  queueName: string;
+  queueUrl: string;
+}
+
+export interface ReceivedEvent {
+  eventId: string;
+  eventType: string;
+  groupId: string;
+  deduplicationId: string;
+  body: Record<string, unknown>;
+  attributes: Record<string, string>;
+}
+
+export function eventsQueueName(): string {
+  return `wager-events-test-${Bun.randomUUIDv7()}.fifo`;
+}
+
+export async function createEventsQueue(client: SQSClient, queueName = eventsQueueName()): Promise<EventsQueue> {
+  const { QueueUrl } = await client.send(
+    new CreateQueueCommand({
+      QueueName: queueName,
+      Attributes: { FifoQueue: "true", ContentBasedDeduplication: "false" },
+    }),
+  );
+  return { queueName, queueUrl: QueueUrl! };
+}
+
+export async function deleteEventsQueue(client: SQSClient, queue: EventsQueue): Promise<void> {
+  await client.send(new DeleteQueueCommand({ QueueUrl: queue.queueUrl }));
+}
+
+export async function receiveEvents(
+  client: SQSClient,
+  queueUrl: string,
+  expected: number,
+  options: { timeoutMs?: number } = {},
+): Promise<ReceivedEvent[]> {
+  const received: ReceivedEvent[] = [];
+  const receiveBatch = async (waitTimeSeconds: number) => {
+    const { Messages } = await client.send(
+      new ReceiveMessageCommand({
+        QueueUrl: queueUrl,
+        MaxNumberOfMessages: 10,
+        WaitTimeSeconds: waitTimeSeconds,
+        MessageSystemAttributeNames: ["MessageGroupId", "MessageDeduplicationId"],
+        MessageAttributeNames: ["All"],
+      }),
+    );
+    for (const message of Messages ?? []) {
+      const attributes = Object.fromEntries(
+        Object.entries(message.MessageAttributes ?? {}).map(([name, value]) => [name, value.StringValue ?? ""]),
+      );
+      received.push({
+        eventId: attributes.eventId ?? "",
+        eventType: attributes.eventType ?? "",
+        groupId: message.Attributes?.MessageGroupId ?? "",
+        deduplicationId: message.Attributes?.MessageDeduplicationId ?? "",
+        body: JSON.parse(message.Body ?? "{}") as Record<string, unknown>,
+        attributes,
+      });
+      await client.send(new DeleteMessageCommand({ QueueUrl: queueUrl, ReceiptHandle: message.ReceiptHandle }));
+    }
+    return (Messages ?? []).length;
+  };
+  const deadline = Date.now() + (options.timeoutMs ?? 20_000);
+  while (received.length < expected) {
+    if (Date.now() > deadline) {
+      throw new Error(`Timed out waiting for ${expected} event(s) in the events queue, got ${received.length}`);
+    }
+    await receiveBatch(1);
+  }
+  while ((await receiveBatch(1)) > 0) {}
+  return received;
+}
+
+export function byGroup(events: ReceivedEvent[]): Map<string, string[]> {
+  const groups = new Map<string, string[]>();
+  for (const event of events) {
+    groups.set(event.groupId, [...(groups.get(event.groupId) ?? []), event.eventId]);
+  }
+  return groups;
+}

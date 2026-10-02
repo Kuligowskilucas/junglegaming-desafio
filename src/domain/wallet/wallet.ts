@@ -77,6 +77,7 @@ export class Wallet {
       ? WalletLedgerEntry.create({
           id: props.openingEntryId,
           walletId: id,
+          walletVersion: 1,
           transactionId: props.openingTransactionId,
           direction: LedgerDirection.Credit,
           money: initialBalance,
@@ -130,6 +131,7 @@ export class Wallet {
     const entry = WalletLedgerEntry.create({
       id: movement.entryId,
       walletId: this.id,
+      walletVersion: this._version + 1,
       transactionId: movement.transactionId,
       direction,
       money: movement.money,

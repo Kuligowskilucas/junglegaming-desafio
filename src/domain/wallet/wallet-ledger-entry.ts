@@ -5,6 +5,7 @@ import { LedgerDirection } from "./ledger-direction";
 export interface LedgerEntryState {
   id: string;
   walletId: string;
+  walletVersion: number;
   transactionId: string;
   direction: LedgerDirection;
   money: Money;
@@ -24,6 +25,7 @@ export class InvalidLedgerEntryError extends InvariantViolationError {
 export class WalletLedgerEntry {
   readonly id: string;
   readonly walletId: string;
+  readonly walletVersion: number;
   readonly transactionId: string;
   readonly direction: LedgerDirection;
   readonly money: Money;
@@ -34,6 +36,7 @@ export class WalletLedgerEntry {
   private constructor(state: LedgerEntryState) {
     this.id = state.id;
     this.walletId = state.walletId;
+    this.walletVersion = state.walletVersion;
     this.transactionId = state.transactionId;
     this.direction = state.direction;
     this.money = state.money;
@@ -44,7 +47,10 @@ export class WalletLedgerEntry {
   }
 
   static create(props: CreateLedgerEntryProps): WalletLedgerEntry {
-    const { id, money, balanceBefore, balanceAfter } = props;
+    const { id, money, balanceBefore, balanceAfter, walletVersion } = props;
+    if (!Number.isSafeInteger(walletVersion) || walletVersion < 1) {
+      throw new InvalidLedgerEntryError(id, "walletVersion must be a positive integer");
+    }
     if (balanceBefore.currency !== money.currency || balanceAfter.currency !== money.currency) {
       throw new InvalidLedgerEntryError(id, "money and balances must share the same currency");
     }

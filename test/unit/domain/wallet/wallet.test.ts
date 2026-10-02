@@ -37,6 +37,7 @@ describe("Wallet.open", () => {
     expect(openingEntry).toBeDefined();
     expect(openingEntry?.direction).toBe(LedgerDirection.Credit);
     expect(openingEntry?.transactionId).toBe("tx-opening");
+    expect(openingEntry?.walletVersion).toBe(1);
     expect(openingEntry?.balanceBefore.toJSON().amount).toBe("0.00");
     expect(openingEntry?.balanceAfter.equals(wallet.balance)).toBe(true);
   });
@@ -78,6 +79,7 @@ describe("Wallet.credit and Wallet.debit", () => {
     expect(entry.walletId).toBe(wallet.id);
     expect(entry.transactionId).toBe("tx-1");
     expect(entry.id).toBe("entry-1");
+    expect(entry.walletVersion).toBe(wallet.version);
   });
 
   test("debit lowers the balance and returns the matching entry", () => {
@@ -201,5 +203,6 @@ describe("Wallet ledger invariant", () => {
       expect(entry.balanceBefore.equals(entries[index]!.balanceAfter)).toBe(true);
     });
     expect(wallet.version).toBe(1 + entriesAfterOpening.length);
+    expect(entries.map((entry) => entry.walletVersion)).toEqual(entries.map((_, index) => index + 1));
   });
 });

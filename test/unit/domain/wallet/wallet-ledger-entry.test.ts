@@ -12,6 +12,7 @@ function entryProps(overrides: Partial<CreateLedgerEntryProps> = {}): CreateLedg
   return {
     id: "entry-1",
     walletId: "wallet-1",
+    walletVersion: 2,
     transactionId: "tx-1",
     direction: LedgerDirection.Debit,
     money: brl("25.00"),
@@ -58,6 +59,10 @@ describe("WalletLedgerEntry.create", () => {
         entryProps({ money: brl("25.00"), balanceBefore: brl("10.00"), balanceAfter: brl("10.00").subtract(brl("25.00")) }),
       ),
     ).toThrow(InvalidLedgerEntryError);
+  });
+
+  test.each([0, -1, 1.5])("rejects the wallet version %p", (walletVersion) => {
+    expect(() => WalletLedgerEntry.create(entryProps({ walletVersion }))).toThrow(InvalidLedgerEntryError);
   });
 
   test("rejects mixed currencies", () => {

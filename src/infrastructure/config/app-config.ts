@@ -16,6 +16,7 @@ const envSchema = z.object({
   DB_PASSWORD: z.string().min(1),
   DB_NAME: z.string().min(1),
   DB_POOL_MAX: positiveInt.default(10),
+  DB_LOCK_TIMEOUT_MS: positiveInt.default(2000),
   AWS_REGION: z.string().min(1),
   SQS_ENDPOINT: z.url().optional(),
   SQS_WAGER_QUEUE_NAME: z.string().endsWith(".fifo"),
@@ -41,6 +42,7 @@ export class AppConfig {
       password: string;
       name: string;
       poolMax: number;
+      lockTimeoutMs: number;
     }>,
     readonly sqs: Readonly<{
       region: string;
@@ -71,6 +73,7 @@ export class AppConfig {
         password: vars.DB_PASSWORD,
         name: vars.DB_NAME,
         poolMax: vars.DB_POOL_MAX,
+        lockTimeoutMs: vars.DB_LOCK_TIMEOUT_MS,
       }),
       Object.freeze({
         region: vars.AWS_REGION,

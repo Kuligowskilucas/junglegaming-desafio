@@ -9,6 +9,7 @@ const transientErrorCodes = new Set([
   "57P02",
   "57P03",
   "53300",
+  "55P03",
   "08000",
   "08003",
   "08006",

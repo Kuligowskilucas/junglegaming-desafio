@@ -14,6 +14,7 @@ export function createMikroOrmOptions(config: AppConfig) {
     password: config.database.password,
     dbName: config.database.name,
     pool: { max: config.database.poolMax },
+    driverOptions: { options: `-c lock_timeout=${config.database.lockTimeoutMs}` },
     entities: persistenceRecords,
     extensions: [Migrator],
     migrations: {

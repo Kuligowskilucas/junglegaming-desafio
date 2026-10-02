@@ -1,4 +1,5 @@
 import type { MikroORM } from "@mikro-orm/postgresql";
+import { Registry } from "prom-client";
 import { OpenWallet } from "../../src/application/wallet/open-wallet";
 import { Money } from "../../src/domain/shared/money";
 import { settleWagerTransaction, type SettlementOutcome } from "../../src/domain/wagering/wager-settlement";
@@ -10,18 +11,20 @@ import { MikroOrmTransactionRunner } from "../../src/infrastructure/database/rep
 import { MikroOrmWagerTransactionRepository } from "../../src/infrastructure/database/repositories/mikro-orm-wager-transaction.repository";
 import { MikroOrmWalletLedgerRepository } from "../../src/infrastructure/database/repositories/mikro-orm-wallet-ledger.repository";
 import { MikroOrmWalletRepository } from "../../src/infrastructure/database/repositories/mikro-orm-wallet.repository";
+import { WageringMetrics } from "../../src/infrastructure/observability/wagering-metrics";
 import { SystemClock } from "../../src/infrastructure/system/system-clock";
 import { UuidV7IdGenerator } from "../../src/infrastructure/system/uuid-v7-id-generator";
 
-export function repositories(orm: MikroORM) {
+export function repositories(orm: MikroORM, metrics = new WageringMetrics(new Registry())) {
   const em = orm.em.fork({ useContext: true });
   return {
     em,
-    wallets: new MikroOrmWalletRepository(em),
+    metrics,
+    wallets: new MikroOrmWalletRepository(em, metrics),
     transactions: new MikroOrmWagerTransactionRepository(em),
     ledger: new MikroOrmWalletLedgerRepository(em),
     outbox: new MikroOrmOutboxRepository(em),
-    runner: new MikroOrmTransactionRunner(em),
+    runner: new MikroOrmTransactionRunner(em, metrics),
   };
 }
 

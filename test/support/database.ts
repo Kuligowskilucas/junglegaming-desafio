@@ -61,3 +61,10 @@ export async function rowLockWaiters(sql: SQL): Promise<number> {
      WHERE datname = current_database() AND wait_event_type = 'Lock' AND wait_event IN ('transactionid', 'tuple')`;
   return count as number;
 }
+
+export async function shiftStoredBalanceBypassingTriggers(sql: SQL, walletId: string, delta: string): Promise<void> {
+  await sql.begin(async (tx) => {
+    await tx`SET LOCAL session_replication_role = replica`;
+    await tx`UPDATE wallets SET balance = balance + ${delta}::numeric WHERE id = ${walletId}`;
+  });
+}

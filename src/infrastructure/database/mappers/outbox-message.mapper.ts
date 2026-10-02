@@ -6,6 +6,8 @@ export const outboxMessageMapper = {
     return OutboxMessage.rehydrate({
       id: record.id,
       aggregateId: record.aggregateId,
+      orderingKey: record.orderingKey,
+      position: record.position ?? undefined,
       eventType: record.eventType,
       payload: record.payload,
       occurredAt: record.occurredAt,
@@ -15,10 +17,11 @@ export const outboxMessageMapper = {
     });
   },
 
-  toRecord(message: OutboxMessage): OutboxMessageRecord {
+  toRecord(message: OutboxMessage): Omit<OutboxMessageRecord, "position"> {
     return {
       id: message.id,
       aggregateId: message.aggregateId,
+      orderingKey: message.orderingKey,
       eventType: message.eventType,
       payload: message.payload,
       occurredAt: message.occurredAt,

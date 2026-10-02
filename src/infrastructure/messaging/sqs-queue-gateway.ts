@@ -81,10 +81,10 @@ export class SqsQueueGateway {
     );
   }
 
-  async send(queueName: string, message: OutgoingMessage): Promise<void> {
+  async send(queueName: string, message: OutgoingMessage, abortSignal?: AbortSignal): Promise<void> {
     await this.client.send(
       new SendMessageCommand({
-        QueueUrl: await this.queueUrls.resolve(queueName),
+        QueueUrl: await this.queueUrls.resolve(queueName, abortSignal),
         MessageBody: message.body,
         MessageGroupId: message.groupId,
         MessageDeduplicationId: message.deduplicationId,
@@ -92,6 +92,7 @@ export class SqsQueueGateway {
           Object.entries(message.attributes ?? {}).map(([name, value]) => [name, { DataType: "String", StringValue: value }]),
         ),
       }),
+      { abortSignal },
     );
   }
 }

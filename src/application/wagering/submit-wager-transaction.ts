@@ -1,24 +1,13 @@
-import type { EventContext } from "../../domain/events/event-context";
-import type { IntegrationEvent } from "../../domain/events/integration-event";
-import { WagerTransactionPendingReference } from "../../domain/events/wager-transaction-pending-reference";
-import { WagerTransactionProcessed } from "../../domain/events/wager-transaction-processed";
-import { WagerTransactionRejected } from "../../domain/events/wager-transaction-rejected";
-import { WalletBalanceChanged } from "../../domain/events/wallet-balance-changed";
-import { OutboxMessage } from "../../domain/messaging/outbox-message";
 import { Money, type MoneyProps } from "../../domain/shared/money";
-import { type SettlementOutcome, settleWagerTransaction } from "../../domain/wagering/wager-settlement";
 import { WagerTransaction } from "../../domain/wagering/wager-transaction";
 import type { WagerTransactionKind } from "../../domain/wagering/wager-transaction-kind";
-import { WagerTransactionStatus } from "../../domain/wagering/wager-transaction-status";
-import type { Wallet } from "../../domain/wallet/wallet";
 import { DuplicateExternalTransactionError, DuplicateWagerTransactionError, IdempotencyConflictError, WalletNotFoundError, WalletPlayerMismatchError,} from "../errors";
 import type { Clock } from "../ports/clock";
 import type { IdGenerator } from "../ports/id-generator";
-import type { OutboxRepository } from "../ports/outbox-repository";
 import type { TransactionRunner } from "../ports/transaction-runner";
 import type { WagerTransactionRepository } from "../ports/wager-transaction-repository";
-import type { WalletLedgerRepository } from "../ports/wallet-ledger-repository";
 import type { WalletRepository } from "../ports/wallet-repository";
+import type { SettleAndRecord } from "./settle-and-record";
 
 export interface WagerTransactionPayload {
   providerId: string;
@@ -48,8 +37,7 @@ export class SubmitWagerTransaction {
   constructor(
     private readonly wallets: WalletRepository,
     private readonly transactions: WagerTransactionRepository,
-    private readonly ledger: WalletLedgerRepository,
-    private readonly outbox: OutboxRepository,
+    private readonly settleAndRecord: SettleAndRecord,
     private readonly transactionRunner: TransactionRunner,
     private readonly clock: Clock,
     private readonly ids: IdGenerator,
@@ -62,6 +50,7 @@ export class SubmitWagerTransaction {
       money: Money.from(command.payload.money),
       id: this.ids.next(),
       idempotencyKey: command.idempotencyKey,
+      correlationId: command.correlationId,
       createdAt: this.clock.now(),
     });
     const previous = await this.transactions.findByIdempotencyKey(candidate.providerId, candidate.idempotencyKey);
@@ -93,31 +82,12 @@ export class SubmitWagerTransaction {
     if (wallet.playerId !== candidate.playerId) {
       throw new WalletPlayerMismatchError(wallet.id, candidate.playerId);
     }
-    const reference =
-      candidate.referenceExternalTransactionId === undefined
-        ? undefined
-        : await this.transactions.findByExternalId(candidate.providerId, candidate.referenceExternalTransactionId);
-    const referenceAlreadyReversed =
-      reference !== undefined &&
-      candidate.requiresReference() &&
-      (await this.transactions.hasProcessedReversalOf(reference.id));
-    const now = this.clock.now();
-    const outcome = settleWagerTransaction({
+    await this.settleAndRecord.execute({
       transaction: candidate,
       wallet,
-      reference,
-      referenceAlreadyReversed,
-      ledgerEntryId: this.ids.next(),
-      at: now < candidate.createdAt ? candidate.createdAt : now,
+      persistence: "INSERT",
+      causationId: command.causationId,
     });
-    await this.transactions.add(candidate);
-    if (outcome.status === WagerTransactionStatus.Processed && outcome.entry) {
-      await this.ledger.append(outcome.entry);
-      await this.wallets.update(wallet);
-    }
-    for (const event of this.eventsFor(candidate, wallet, outcome, command)) {
-      await this.outbox.add(OutboxMessage.enqueue(event));
-    }
     return { transaction: candidate, idempotentReplay: false };
   }
 
@@ -144,29 +114,5 @@ export class SubmitWagerTransaction {
       }
     }
     throw error;
-  }
-
-  private eventsFor(
-    transaction: WagerTransaction,
-    wallet: Wallet,
-    outcome: SettlementOutcome,
-    command: SubmitWagerTransactionCommand,
-  ): IntegrationEvent<unknown>[] {
-    const context = (): EventContext => ({
-      eventId: this.ids.next(),
-      correlationId: command.correlationId,
-      causationId: command.causationId,
-      occurredAt: transaction.updatedAt,
-    });
-    switch (outcome.status) {
-      case WagerTransactionStatus.Processed:
-        return outcome.entry
-          ? [WagerTransactionProcessed.from(transaction, context()), WalletBalanceChanged.from(wallet, outcome.entry, context())]
-          : [WagerTransactionProcessed.from(transaction, context())];
-      case WagerTransactionStatus.Rejected:
-        return [WagerTransactionRejected.from(transaction, context())];
-      case WagerTransactionStatus.PendingReference:
-        return [WagerTransactionPendingReference.from(transaction, context())];
-    }
   }
 }

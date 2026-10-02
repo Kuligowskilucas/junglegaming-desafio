@@ -12,7 +12,11 @@ export class SqsHealth {
   ) {}
 
   async check(abortSignal: AbortSignal): Promise<void> {
-    const queueNames = [this.config.sqs.wagerQueueName, this.config.sqs.wagerDeadLetterQueueName];
+    const queueNames = [
+      this.config.sqs.wagerQueueName,
+      this.config.sqs.wagerDeadLetterQueueName,
+      this.config.sqs.eventsQueueName,
+    ];
     await Promise.all(queueNames.map((queueName) => this.assertQueueReachable(queueName, abortSignal)));
   }
 

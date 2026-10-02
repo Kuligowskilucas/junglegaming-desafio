@@ -27,12 +27,13 @@ services:
       SQS_WAGER_QUEUE_NAME: ${SQS_WAGER_QUEUE_NAME:?copie .env.example para .env}
       SQS_WAGER_DLQ_NAME: ${SQS_WAGER_DLQ_NAME:?copie .env.example para .env}
       SQS_MAX_RECEIVE_COUNT: ${SQS_MAX_RECEIVE_COUNT:-10}
+      SQS_EVENTS_QUEUE_NAME: ${SQS_EVENTS_QUEUE_NAME:-wager-events.fifo}
     ports:
       - "4566:4566"
     volumes:
       - ./docker/sqs/init/ready.d:/etc/localstack/init/ready.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "awslocal sqs get-queue-url --queue-name \"$${SQS_WAGER_QUEUE_NAME}\""]
+      test: ["CMD-SHELL", "awslocal sqs get-queue-url --queue-name \"$${SQS_EVENTS_QUEUE_NAME}\""]
       interval: 2s
       timeout: 5s
       retries: 60

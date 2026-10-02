@@ -11,6 +11,7 @@ export const WagerTransactionRecord = defineEntity({
     providerId: p.text(),
     externalTransactionId: p.text(),
     idempotencyKey: p.text(),
+    correlationId: p.text(),
     payloadHash: p.string(),
     walletId: p.uuid(),
     playerId: p.uuid(),

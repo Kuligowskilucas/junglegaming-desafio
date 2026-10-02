@@ -72,6 +72,7 @@ export class OpenWallet {
       walletId: wallet.id,
       playerId: wallet.playerId,
       money: openingEntry.money,
+      correlationId,
       at,
     });
     await this.transactions.add(opening);

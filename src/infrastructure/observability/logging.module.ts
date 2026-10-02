@@ -5,14 +5,13 @@ import { Module } from "@nestjs/common";
 import { LoggerModule } from "nestjs-pino";
 import { stdTimeFunctions } from "pino";
 import { AppConfig } from "../config/app-config";
+import { isAcceptedCorrelationId } from "./correlation-id";
 
 const correlationIdHeader = "x-correlation-id";
-const acceptedCorrelationId = /^[A-Za-z0-9._:-]{1,128}$/;
 
 function correlationIdOf(request: IncomingMessage, response: ServerResponse): string {
   const received = request.headers[correlationIdHeader];
-  const correlationId =
-    typeof received === "string" && acceptedCorrelationId.test(received) ? received : randomUUID();
+  const correlationId = isAcceptedCorrelationId(received) ? received : randomUUID();
   response.setHeader(correlationIdHeader, correlationId);
   return correlationId;
 }

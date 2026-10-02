@@ -17,3 +17,8 @@ awslocal sqs create-queue \
   --queue-name "$SQS_WAGER_QUEUE_NAME" \
   --attributes "{\"FifoQueue\":\"true\",\"ContentBasedDeduplication\":\"false\",\"VisibilityTimeout\":\"30\",\"ReceiveMessageWaitTimeSeconds\":\"20\",\"RedrivePolicy\":\"${redrive_policy}\"}" \
   --query QueueUrl --output text
+
+awslocal sqs create-queue \
+  --queue-name "$SQS_EVENTS_QUEUE_NAME" \
+  --attributes FifoQueue=true,ContentBasedDeduplication=false,MessageRetentionPeriod=1209600 \
+  --query QueueUrl --output text

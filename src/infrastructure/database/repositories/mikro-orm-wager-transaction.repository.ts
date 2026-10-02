@@ -1,7 +1,10 @@
 import { EntityManager } from "@mikro-orm/postgresql";
 import { Injectable } from "@nestjs/common";
 import { DuplicateWagerTransactionError } from "../../../application/errors";
-import { WagerTransactionRepository } from "../../../application/ports/wager-transaction-repository";
+import {
+  type DueReferenceRetry,
+  WagerTransactionRepository,
+} from "../../../application/ports/wager-transaction-repository";
 import type { WagerTransaction } from "../../../domain/wagering/wager-transaction";
 import { WagerTransactionKind } from "../../../domain/wagering/wager-transaction-kind";
 import { WagerTransactionStatus } from "../../../domain/wagering/wager-transaction-status";
@@ -27,6 +30,46 @@ export class MikroOrmWagerTransactionRepository extends WagerTransactionReposito
       }
       throw error;
     }
+  }
+
+  async update(transaction: WagerTransaction): Promise<void> {
+    const record = wagerTransactionMapper.toRecord(transaction);
+    await this.em.nativeUpdate(
+      WagerTransactionRecord,
+      { id: transaction.id },
+      {
+        status: record.status,
+        referenceTransactionId: record.referenceTransactionId,
+        failureCode: record.failureCode,
+        observedBalance: record.observedBalance,
+        referenceAttempts: record.referenceAttempts,
+        nextReferenceAttemptAt: record.nextReferenceAttemptAt,
+        updatedAt: record.updatedAt,
+        processedAt: record.processedAt,
+      },
+    );
+  }
+
+  async findDueForReferenceRetry(now: Date, limit: number): Promise<DueReferenceRetry[]> {
+    const records = await this.em.find(
+      WagerTransactionRecord,
+      { status: WagerTransactionStatus.PendingReference, nextReferenceAttemptAt: { $lte: now } },
+      { fields: ["id", "walletId"], orderBy: { nextReferenceAttemptAt: "asc" }, limit, refresh: true },
+    );
+    return records.map((record) => ({ transactionId: record.id, walletId: record.walletId }));
+  }
+
+  rescheduleDependentsOf(providerId: string, externalTransactionId: string, at: Date): Promise<number> {
+    return this.em.nativeUpdate(
+      WagerTransactionRecord,
+      {
+        status: WagerTransactionStatus.PendingReference,
+        providerId,
+        referenceExternalTransactionId: externalTransactionId,
+        nextReferenceAttemptAt: { $gt: at },
+      },
+      { nextReferenceAttemptAt: at },
+    );
   }
 
   findById(transactionId: string): Promise<WagerTransaction | undefined> {

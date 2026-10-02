@@ -6,6 +6,7 @@ import { HealthModule } from "./interfaces/http/health/health.module";
 import { WageringModule } from "./interfaces/http/wagering/wagering.module";
 import { WalletsModule } from "./interfaces/http/wallets/wallets.module";
 import { SqsConsumerModule } from "./interfaces/sqs/sqs-consumer.module";
+import { WorkersModule } from "./interfaces/workers/workers.module";
 
 @Module({})
 export class AppModule {
@@ -19,6 +20,7 @@ export class AppModule {
         WalletsModule,
         WageringModule,
         SqsConsumerModule,
+        WorkersModule,
       ],
     };
   }

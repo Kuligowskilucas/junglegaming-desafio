@@ -21,6 +21,7 @@ const envSchema = z.object({
   SQS_ENDPOINT: z.url().optional(),
   SQS_WAGER_QUEUE_NAME: z.string().endsWith(".fifo"),
   SQS_WAGER_DLQ_NAME: z.string().endsWith(".fifo"),
+  SQS_EVENTS_QUEUE_NAME: z.string().endsWith(".fifo").default("wager-events.fifo"),
   SQS_CONSUMER_ENABLED: z.enum(["true", "false"]).default("false"),
   SQS_CONSUMER_NAME: z.string().min(1).max(128).default("wager-transactions-consumer"),
   SQS_WAIT_TIME_SECONDS: z.coerce.number().int().min(0).max(20).default(20),
@@ -29,6 +30,15 @@ const envSchema = z.object({
   SQS_RETRY_BASE_SECONDS: positiveInt.default(2),
   SQS_RETRY_MAX_SECONDS: positiveInt.max(43_200).default(300),
   SQS_SHUTDOWN_GRACE_MS: positiveInt.default(10_000),
+  OUTBOX_PUBLISHER_ENABLED: z.enum(["true", "false"]).default("false"),
+  OUTBOX_POLL_INTERVAL_MS: positiveInt.default(500),
+  OUTBOX_BATCH_WALLETS: positiveInt.max(1_000).default(20),
+  OUTBOX_BATCH_EVENTS_PER_WALLET: positiveInt.max(1_000).default(50),
+  OUTBOX_PUBLISH_TIMEOUT_MS: positiveInt.default(5_000),
+  REFERENCE_WORKER_ENABLED: z.enum(["true", "false"]).default("false"),
+  REFERENCE_WORKER_POLL_INTERVAL_MS: positiveInt.default(1_000),
+  REFERENCE_WORKER_BATCH: positiveInt.max(1_000).default(50),
+  WORKER_SHUTDOWN_GRACE_MS: positiveInt.default(10_000),
   HEALTH_CHECK_TIMEOUT_MS: positiveInt.default(1000),
 });
 
@@ -61,6 +71,7 @@ export class AppConfig {
       endpoint: string | undefined;
       wagerQueueName: string;
       wagerDeadLetterQueueName: string;
+      eventsQueueName: string;
       consumer: Readonly<{
         enabled: boolean;
         name: string;
@@ -72,6 +83,15 @@ export class AppConfig {
         shutdownGraceMs: number;
       }>;
     }>,
+    readonly outbox: Readonly<{
+      publisherEnabled: boolean;
+      pollIntervalMs: number;
+      batchOrderingKeys: number;
+      batchMessagesPerOrderingKey: number;
+      publishTimeoutMs: number;
+    }>,
+    readonly referenceWorker: Readonly<{ enabled: boolean; pollIntervalMs: number; batchSize: number }>,
+    readonly workers: Readonly<{ shutdownGraceMs: number }>,
     readonly health: Readonly<{ timeoutMs: number }>,
   ) {
     Object.freeze(this);
@@ -86,9 +106,13 @@ export class AppConfig {
     }
     const vars = result.data;
     const concurrency = consumerConcurrency(vars);
-    if (vars.SQS_CONSUMER_ENABLED === "true" && concurrency >= vars.DB_POOL_MAX) {
+    const backgroundConnections =
+      (vars.SQS_CONSUMER_ENABLED === "true" ? concurrency : 0) +
+      (vars.OUTBOX_PUBLISHER_ENABLED === "true" ? 1 : 0) +
+      (vars.REFERENCE_WORKER_ENABLED === "true" ? 1 : 0);
+    if (backgroundConnections >= vars.DB_POOL_MAX) {
       throw new InvalidConfigError([
-        `SQS_CONSUMER_CONCURRENCY: must be lower than DB_POOL_MAX (${vars.DB_POOL_MAX}) to keep connections for the API, got ${concurrency}`,
+        `DB_POOL_MAX: background work needs ${backgroundConnections} connection(s) (consumer ${vars.SQS_CONSUMER_ENABLED === "true" ? concurrency : 0}, publisher and worker 1 each when enabled) and must leave connections for the API, got ${vars.DB_POOL_MAX}`,
       ]);
     }
     return new AppConfig(
@@ -108,6 +132,7 @@ export class AppConfig {
         endpoint: vars.SQS_ENDPOINT,
         wagerQueueName: vars.SQS_WAGER_QUEUE_NAME,
         wagerDeadLetterQueueName: vars.SQS_WAGER_DLQ_NAME,
+        eventsQueueName: vars.SQS_EVENTS_QUEUE_NAME,
         consumer: Object.freeze({
           enabled: vars.SQS_CONSUMER_ENABLED === "true",
           name: vars.SQS_CONSUMER_NAME,
@@ -119,6 +144,19 @@ export class AppConfig {
           shutdownGraceMs: vars.SQS_SHUTDOWN_GRACE_MS,
         }),
       }),
+      Object.freeze({
+        publisherEnabled: vars.OUTBOX_PUBLISHER_ENABLED === "true",
+        pollIntervalMs: vars.OUTBOX_POLL_INTERVAL_MS,
+        batchOrderingKeys: vars.OUTBOX_BATCH_WALLETS,
+        batchMessagesPerOrderingKey: vars.OUTBOX_BATCH_EVENTS_PER_WALLET,
+        publishTimeoutMs: vars.OUTBOX_PUBLISH_TIMEOUT_MS,
+      }),
+      Object.freeze({
+        enabled: vars.REFERENCE_WORKER_ENABLED === "true",
+        pollIntervalMs: vars.REFERENCE_WORKER_POLL_INTERVAL_MS,
+        batchSize: vars.REFERENCE_WORKER_BATCH,
+      }),
+      Object.freeze({ shutdownGraceMs: vars.WORKER_SHUTDOWN_GRACE_MS }),
       Object.freeze({ timeoutMs: vars.HEALTH_CHECK_TIMEOUT_MS }),
     );
   }

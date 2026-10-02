@@ -8,6 +8,7 @@ import {
 import { backoffDelayMs } from "../../domain/shared/retry-backoff";
 import { AppConfig } from "../../infrastructure/config/app-config";
 import { DatabaseContext } from "../../infrastructure/database/database-context";
+import { isAcceptedCorrelationId } from "../../infrastructure/observability/correlation-id";
 import { type ReceivedMessage, SqsQueueGateway } from "../../infrastructure/messaging/sqs-queue-gateway";
 import { ConcurrencyLimit } from "./concurrency-limit";
 import { classifyFailure, type FailureClassification } from "./failure-classification";
@@ -153,7 +154,8 @@ export class WagerTransactionConsumer implements OnApplicationBootstrap, BeforeA
     let result: MessageHandlingResult;
     try {
       envelope = parseWagerTransactionMessage(message.body);
-      const correlationId = message.attributes.correlationId ?? envelope.messageId;
+      const received = message.attributes.correlationId;
+      const correlationId = isAcceptedCorrelationId(received) ? received : envelope.messageId;
       this.pino.assign({ messageId: envelope.messageId, correlationId });
       result = await this.handler.handle(
         toWagerTransactionRequest(envelope, { consumerName: this.settings.name, correlationId }),

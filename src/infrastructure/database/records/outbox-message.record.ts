@@ -6,6 +6,8 @@ export const OutboxMessageRecord = defineEntity({
   properties: {
     id: p.uuid().primary(),
     aggregateId: p.uuid(),
+    orderingKey: p.text(),
+    position: p.bigint("number").nullable().persist(false),
     eventType: p.text(),
     payload: p.json<Record<string, unknown>>(),
     occurredAt: p.datetime(),

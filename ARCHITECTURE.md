@@ -43,12 +43,12 @@ src/
 ├── infrastructure/    adaptadores de saída e serviços técnicos
 │   ├── config/        AppConfig (env validado)
 │   ├── database/      MikroORM, health, records, mappers, repositórios, migrations
-│   ├── messaging/     cliente SQS, health, publisher do outbox
+│   ├── messaging/     cliente SQS, health, publicação de eventos na fila
 │   └── observability/ logs, métricas
 └── interfaces/        adaptadores de entrada
     ├── http/          controllers, validação, mapeamento erro → status
-    ├── sqs/           consumer com inbox                                          (Etapa 5)
-    └── workers/       publisher do outbox, reprocessamento de PENDING_REFERENCE  (Etapa 5)
+    ├── sqs/           consumer com inbox                                          (Etapa 5a)
+    └── workers/       publisher do outbox, reprocessamento de PENDING_REFERENCE  (Etapa 5b)
 test/
 ├── support/  unit/  integration/  concurrency/
 ```
@@ -75,12 +75,13 @@ O critério foi a fidelidade do comportamento de FIFO e redrive. Para manter a t
 
 ### D2. Criação das filas: script `ready.d` no container do emulador
 
-O script `docker/sqs/init/ready.d/01-create-queues.sh` roda quando o LocalStack fica pronto, de novo a cada start, porque o emulador não persiste estado. O healthcheck do serviço consulta a fila principal (`awslocal sqs get-queue-url`), então `docker compose up --wait` só retorna depois que as filas existem.
+O script `docker/sqs/init/ready.d/01-create-queues.sh` roda quando o LocalStack fica pronto, de novo a cada start, porque o emulador não persiste estado. O healthcheck do serviço consulta a fila de eventos, que é a última criada (`awslocal sqs get-queue-url`), então `docker compose up --wait` só retorna depois que todas as filas existem.
 
 | Fila | Atributos |
 |---|---|
 | `wager-transactions-dlq.fifo` | `FifoQueue=true`, retenção de 14 dias |
 | `wager-transactions.fifo` | `FifoQueue=true`, `ContentBasedDeduplication=false` (o produtor envia `MessageDeduplicationId=messageId`), `VisibilityTimeout=30`, `ReceiveMessageWaitTimeSeconds=20` (long polling), `RedrivePolicy={deadLetterTargetArn: DLQ, maxReceiveCount: SQS_MAX_RECEIVE_COUNT}` (10 desde a Etapa 5a, D31) |
+| `wager-events.fifo` | `FifoQueue=true`, `ContentBasedDeduplication=false` (o publisher envia `MessageDeduplicationId=eventId`), retenção de 14 dias, sem DLQ própria (Etapa 5b, D35) |
 
 Alternativas descartadas:
 - **Criar na subida da aplicação:** em produção exigiria permissão de `CreateQueue` para a app e geraria corrida entre instâncias. Provisionamento é responsabilidade da infra (IaC), não do runtime.
@@ -129,7 +130,7 @@ Formato: uma linha JSON por evento com `level` (label), `time` (ISO-8601), `serv
 ### D6. Health checks
 
 - **`GET /health/live`:** sempre 200 enquanto o processo responde. Não consulta dependências, para que uma queda do banco não faça o orquestrador reiniciar todas as instâncias em cascata.
-- **`GET /health/ready`:** checa Postgres (`select 1`) e SQS (`GetQueueAttributes` nas duas filas) em paralelo, cada um com timeout `HEALTH_CHECK_TIMEOUT_MS`. Devolve 200 `{status:"ok", checks}` ou 503 `{status:"unavailable", checks}`, e cada dependência fica `up` ou `down` com `reason` igual a `timeout` ou `unavailable`. O endpoint é aberto, então a resposta não expõe mensagens de erro, hosts nem stack. Esses detalhes vão para o log.
+- **`GET /health/ready`:** checa Postgres (`select 1`) e SQS (`GetQueueAttributes` na fila de entrada, na DLQ e, desde a Etapa 5b, na fila de eventos) em paralelo, cada um com timeout `HEALTH_CHECK_TIMEOUT_MS`. Devolve 200 `{status:"ok", checks}` ou 503 `{status:"unavailable", checks}`, e cada dependência fica `up` ou `down` com `reason` igual a `timeout` ou `unavailable`. O endpoint é aberto, então a resposta não expõe mensagens de erro, hosts nem stack. Esses detalhes vão para o log.
 - Escritos à mão, sem `@nestjs/terminus`: são duas checagens, e o `MikroOrmHealthIndicator` do terminus tem histórico de incompatibilidade com `defineConfig`.
 - **O MikroORM 7 conecta sob demanda.** O `MikroORM.init` não abre conexão, e o primeiro `execute` faz isso. Consequência: a app sobe mesmo com o banco fora, o `/ready` responde 503 e volta a 200 sozinho quando o banco volta. Por isso o check usa `execute("select 1")` e não `checkConnection()`, que só informa "não conectado" antes da primeira query.
 - A URL de cada fila é resolvida uma vez por `GetQueueUrl` e guardada em cache (`QueueUrlResolver`). Isso independe do emulador e do formato de URL.
@@ -507,7 +508,7 @@ Toda resposta de transação leva `Location: /wagering/transactions/:id`. No 422
 | Persistir como REJECTED | O `observed_balance` obrigatório exporia o saldo de **outra** wallet no replay e no evento |
 | 404 | Esconderia o erro real do provedor |
 
-**Dependentes em PENDING_REFERENCE (P6):** não são processadas no mesmo pedido da referência. Isso alongaria a transação, encadearia efeitos e faria uma falha da dependente derrubar a referência. Ficam com o worker da Etapa 5, que pode ganhar um "empurrão": ao processar uma referência, reagendar para agora as dependentes que esperam por ela, com um índice parcial `(provider_id, reference_external_transaction_id) WHERE status = 'PENDING_REFERENCE'`.
+**Dependentes em PENDING_REFERENCE (P6):** não são processadas no mesmo pedido da referência. Isso alongaria a transação, encadearia efeitos e faria uma falha da dependente derrubar a referência. Ficam com o worker da Etapa 5, que pode ganhar um "empurrão": ao processar uma referência, reagendar para agora as dependentes que esperam por ela, com um índice parcial `(provider_id, reference_external_transaction_id) WHERE status = 'PENDING_REFERENCE'`. **Implementado na Etapa 5b (D38).**
 
 **Pendência para a Etapa 5 (resolvida em D30): erros não persistidos não geram evento.** `WALLET_PLAYER_MISMATCH`, wallet inexistente e payload inválido (`VALIDATION_FAILED`, `INVALID_MONEY`, `INVALID_WAGER_TRANSACTION`) não criam linha em `wager_transactions` nem evento no outbox. Pelo HTTP, o provedor recebe o 4xx. **Pelo SQS, onde não há resposta, o provedor não ficaria sabendo.** A Etapa 5 precisa decidir o destino deles, por exemplo DLQ como erro permanente, com o motivo nos atributos da mensagem, e/ou um evento próprio de rejeição de entrada.
 
@@ -612,20 +613,139 @@ O grupo é a unidade de concorrência do sistema: ordena por wallet e paraleliza
 - A espera por "o consumer está travado no lock da wallet" conta só esperas por lock de linha (`wait_event` `transactionid`/`tuple`). No `bun test --parallel`, arquivos de outros processos esperando o advisory lock de integração também aparecem como espera de lock e confundiam a contagem.
 - **Correção da Etapa 1:** o `bunfig.toml` não tem opção de timeout de teste, então o `timeout = 20000` que estava lá era ignorado em silêncio e valia o padrão de 5 s. Agora o `useIntegrationEnvironment()` chama `setDefaultTimeout(30_000)`, que vale para o arquivo corrente; por isso a chamada fica no helper que todo arquivo de integração já usa, e não no preload.
 
-## 8. Autenticação
+## 8. Publisher do outbox e worker de PENDING_REFERENCE
+
+Etapa 5b: publicação dos eventos do outbox (seção 11 do enunciado) e reprocessamento das transações em PENDING_REFERENCE (seção 7.1), os dois no processo da API.
+
+### D35. Destino dos eventos e contrato (P1, P10)
+
+| Opção | Resultado |
+|---|---|
+| **Fila SQS FIFO `wager-events.fifo` (escolhida)** | Mesma infra; ordem por grupo; deduplicação nativa de 5 min; contrato simples para o consumidor; testável com receive |
+| Tópico SNS FIFO + filas SQS FIFO assinantes | Fan-out mantendo ordem e dedup, mas mais um serviço no LocalStack, com assinaturas para configurar e testar, e hoje nenhum consumidor pede fan-out |
+| EventBridge / Kinesis | Roteamento e replay muito além da necessidade |
+
+**Mensagem publicada** (`SqsEventPublisher`):
+- **corpo:** o `payload` do outbox, que é o envelope de `IntegrationEvent.toJSON()` (`eventId`, `eventType`, `aggregateId`, `correlationId`, `causationId` opcional, `occurredAt`, `version`, `data`);
+- **`MessageGroupId`:** `ordering_key` do outbox, que é o `walletId` (a unidade de ordem, D36);
+- **`MessageDeduplicationId`:** `eventId`, que é também o id da linha do outbox;
+- **atributos:** `eventType`, `eventId`, `aggregateId`, `correlationId` e `version`, para filtrar e rastrear sem abrir o corpo.
+
+**Contrato do consumidor:** deduplicar por `eventId` (D37) e processar em ordem por grupo. A fila não tem DLQ própria e guarda as mensagens por 14 dias: retry e DLQ são responsabilidade de quem consome, que ainda não existe neste repositório. Evoluir para SNS FIFO fica para quando houver mais de um consumidor; o publisher só troca o `SendMessage` por `Publish`.
+
+### D36. Divisão do trabalho entre publishers e ordem por wallet (P2, P3, P7)
+
+**Divisão: `FOR UPDATE SKIP LOCKED` com a transação aberta durante o envio.**
+
+| Opção | Resultado |
+|---|---|
+| **SKIP LOCKED segurando a transação (escolhida)** | Nenhuma coluna de reserva; se o processo morre, a conexão cai, o Postgres desfaz e as linhas ficam livres **na hora** para outra instância; uma conexão por publisher; as linhas travadas não bloqueiam o caminho de negócio, que só faz INSERT no outbox |
+| Reserva com prazo (`locked_until`, `locked_by`) | Transação curta, mas duas colunas, guard e migration a mais; depois de um crash, a retomada espera o prazo vencer; prazo curto demais publica em dobro enquanto o primeiro ainda está lento |
+| Um publisher ativo por vez (advisory lock de liderança) | Ordem trivial, mas sem paralelismo: "funciona com vários publishers" só no sentido de ficarem parados |
+
+O custo é a transação aberta durante a chamada de rede. Ele é limitado pelo timeout de cada envio (`OUTBOX_PUBLISH_TIMEOUT_MS`, 5 s, via `AbortSignal` no SDK) e pelo tamanho do lote.
+
+**Ordem estrita por wallet.** Com SKIP LOCKED puro, dois publishers poderiam pegar eventos diferentes da mesma wallet e publicá-los fora de ordem, por exemplo um `WagerTransactionProcessed` antes do `WagerTransactionPendingReference` da mesma transação. A migration 7 acrescenta ao outbox:
+- **`ordering_key`** (`walletId`, vindo de `IntegrationEvent.orderingKey`, que cada subclasse preenche);
+- **`position bigint GENERATED ALWAYS AS IDENTITY`**. Os eventos de uma wallet são gravados com o lock dela, então a ordem de `position` dentro de uma wallet é a ordem de commit, sem depender de relógio;
+- o índice parcial `outbox_messages_pending_by_ordering_key (ordering_key, position) WHERE published_at IS NULL`.
+
+Os dois campos entram na lista de colunas imutáveis do guard do outbox, e o backfill das linhas existentes desliga o guard só durante o próprio UPDATE.
+
+**Reivindicação em dois passos, na mesma transação** (`MikroOrmOutboxRepository.claimDue`, com o query builder Kysely do MikroORM ligado à transação corrente, sem SQL cru):
+1. trava com `SKIP LOCKED` as **cabeças**: o evento pendente mais antigo de cada wallet (`NOT EXISTS` de pendente anterior com a mesma chave) que já venceu, até `OUTBOX_BATCH_WALLETS` (20) wallets;
+2. para essas wallets, trava os pendentes seguintes em ordem de `position` e aproveita os que já venceram até o primeiro que não venceu, no máximo `OUTBOX_BATCH_EVENTS_PER_WALLET` (50).
+
+Quem detém a cabeça é dono da wallet naquele ciclo; os outros publishers não pegam eventos dela, porque não são cabeça. O passo 2 não usa SKIP LOCKED, e não precisa: só o dono da cabeça chega a essas linhas.
+
+**Ciclo do publisher** (`PublishPendingEvents.runOnce`): reivindica, publica **wallets em paralelo e eventos da mesma wallet em sequência**, marca cada um (`markPublished` ou `scheduleRetry`, com o backoff de D15) e grava tudo no mesmo COMMIT. Numa falha, os eventos seguintes da mesma wallet ficam para depois do retry dela, a mesma semântica do grupo FIFO. Se o ciclo publicou algo, roda de novo na hora; senão, espera `OUTBOX_POLL_INTERVAL_MS` (500 ms).
+
+**Medido** (dois publishers, 150 eventos em 25 wallets, lote reduzido a 5 wallets × 2 eventos para forçar disputa): divisão de 70 + 80 envios, **150 envios no total** (nenhum evento enviado duas vezes), ordem por wallet igual à de `position`, zero duplicatas na fila.
+
+### D37. Morte do processo e duplicatas
+
+- **Morreu depois do commit de negócio e antes de publicar:** o evento está pendente no outbox, confirmado junto com o efeito, e o publisher de qualquer instância o publica. Nada se perde.
+- **Morreu depois de o SQS aceitar e antes de marcar:** a transação do publisher é desfeita, o evento volta a pendente e é **publicado de novo**.
+  - **Dentro de 5 min**, a FIFO descarta a duplicata pelo `MessageDeduplicationId = eventId`.
+  - **Depois disso**, a duplicata chega, e é segura porque o contrato do consumidor é deduplicar por `eventId` (o mesmo padrão de inbox da entrada, D29).
+- **"Sem duplicar indefinidamente":** um evento só é republicado enquanto não for marcado. Marcado, nunca mais é reivindicado, porque o guard grava `published_at` uma vez e impede voltar.
+- **Verificado:** com um trigger temporário fazendo falhar o UPDATE que marca `published_at`, o publisher enviou 4 eventos 4 vezes (16 envios) antes de o trigger sair. A fila entregou cada um **uma vez**.
+
+### D38. Worker de PENDING_REFERENCE, empurrão e eventos (P4, P6, P9)
+
+**Regra de negócio num lugar só.** O trecho "resolver a referência → `referenceAlreadyReversed` → `settleWagerTransaction` → gravar transação, lançamento, wallet e outbox → empurrão" saiu de `SubmitWagerTransaction` para `SettleAndRecord`. A submissão o chama com a transação nova (INSERT); o worker, com a existente (UPDATE de campos mutáveis, que o guard de `wager_transactions` limita).
+
+**Ciclo do worker** (`RetryPendingReferences.runOnce`):
+1. lista até `REFERENCE_WORKER_BATCH` (50) transações vencidas (`status = 'PENDING_REFERENCE' AND next_reference_attempt_at <= now`, índice `wager_transactions_pending_reference_due`);
+2. para cada uma, em sequência e em transação própria: **trava a wallet** (o mesmo lock da submissão HTTP e do consumer), **relê a transação sob o lock**, pula se ela não está mais pendente ou ainda não venceu, e chama o `SettleAndRecord`. O domínio decide: PROCESSED, REJECTED (inclusive por limite esgotado, D12.1) ou nova tentativa com backoff;
+3. com lote cheio e sem falhas, roda de novo na hora; senão, espera `REFERENCE_WORKER_POLL_INTERVAL_MS` (1 s).
+
+**Concorrência:**
+- com HTTP ou consumer na mesma wallet, o lock serializa. A transação pendente só é alterada pelo worker;
+- com dois workers, os dois podem listar o mesmo id, mas o segundo, depois de pegar o lock, relê e encontra a transação resolvida ou reagendada, e pula. O índice de reversão única (D17) e o guard de estado terminal são as últimas barreiras.
+
+**Empurrão (P6).** Quando uma transação chega a um desfecho **terminal** (PROCESSED ou REJECTED), o `SettleAndRecord` reagenda para aquele instante as dependentes que esperam por ela:
+
+```
+UPDATE wager_transactions SET next_reference_attempt_at = :at
+ WHERE status = 'PENDING_REFERENCE' AND provider_id = :providerId
+   AND reference_external_transaction_id = :externalTransactionId AND next_reference_attempt_at > :at
+```
+
+É um `nativeUpdate`, permitido pelo guard (linha não terminal, payload intacto, tentativas iguais), com o índice parcial novo `wager_transactions_waiting_for_reference`. A dependente fica vencida logo após o commit, e o worker a resolve no próximo ciclo (≤ 1 s) em vez de esperar o backoff (até 60 s). Vale também para REJECTED, porque a dependente pode ser rejeitada com `REFERENCE_NOT_PROCESSED` sem esperar. É só reagendamento: quem decide continua sendo o domínio. Verificado: uma dependente com a próxima tentativa empurrada por SQL para daqui a 1 h foi resolvida logo depois que a referência chegou (o teste exige menos de 5 s).
+
+**`WagerTransactionPendingReference` só na primeira vez (P4)**, na transição PENDING → PENDING_REFERENCE. As novas tentativas não mudam o estado; o progresso aparece em `referenceAttempts` e `nextReferenceAttemptAt` no GET. Quando a transação sai do estado, sai `WagerTransactionProcessed` (mais `WalletBalanceChanged`, se houver lançamento) ou `WagerTransactionRejected`.
+
+**Replay:** reenviar a submissão depois que o worker a resolveu devolve o estado final. Um REFUND que voltou 202 passa a voltar 200 PROCESSED com `idempotentReplay: true` e o saldo observado na resolução.
+
+**Limite esgotado testado por "viagem no tempo" (P9).** O teste grava `reference_attempts = 8` e vencimento imediato por SQL (o guard aceita, porque as tentativas só sobem). A política continua sendo constante de domínio (D12.1), e o teste não espera os ~3 min reais.
+
+### D39. `correlation_id` persistido na transação (ajuste da aprovação, P5)
+
+A proposta original era usar o id da transação como `correlationId` dos eventos do worker, que roda sem requisição. Na aprovação, foi pedido persistir o `correlationId` original, para que o rastreio vá **da requisição até o evento final**, mesmo quando o desfecho sai minutos depois, em outro processo.
+- A migration 7 acrescenta `wager_transactions.correlation_id text NOT NULL`, com `CHECK (length BETWEEN 1 AND 128)` (`wager_transactions_correlation_id_bounds`). As linhas anteriores recebem o próprio id da transação no backfill.
+- É gravado na criação (`WagerTransaction.create` e `WagerTransaction.opening` exigem o campo) e **entra na lista de colunas imutáveis do guard** (`wager_transactions_payload_immutable`).
+- Todos os eventos da transação, os da submissão e os do worker, usam `transaction.correlationId`. O `causationId` continua sendo o `messageId` quando a origem é o SQS, e fica ausente nos eventos do worker, que não têm mensagem de origem.
+- **De onde vem o valor:** no HTTP, o header `x-correlation-id` quando aceito (`^[A-Za-z0-9._:-]{1,128}$`) ou um UUID gerado; no SQS, o atributo `correlationId` com a **mesma regra**, ou o `messageId`. A regra foi extraída para `infrastructure/observability/correlation-id.ts` e passou a valer também no consumer; antes, um atributo com mais de 128 caracteres violaria o CHECK novo.
+- **Verificado:** um REFUND enviado com `x-correlation-id: manual-refund-2` antes da BET publicou `PendingReference`, `Processed` e `WalletBalanceChanged` com esse `correlationId`, os dois últimos emitidos pelo worker.
+
+### D40. Onde rodam, shutdown e o pool (P7, P8)
+
+- **Onde rodam:** no processo da API, ligados por `OUTBOX_PUBLISHER_ENABLED` e `REFERENCE_WORKER_ENABLED` (`true` no `.env.example`, `false` no `.env.test`; os testes ligam por app). São providers Nest em `src/interfaces/workers`, com o ciclo de vida do consumer (D33).
+- **`PollingLoop`:** o laço comum aos dois. Roda um ciclo; se o ciclo diz que há mais trabalho, roda de novo; senão, espera o intervalo numa espera que o shutdown interrompe. Um erro no ciclo é logado e vira espera, sem derrubar o laço.
+- **Shutdown** (`beforeApplicationShutdown`): para o laço, interrompe a espera na hora e deixa o ciclo em andamento terminar, até `WORKER_SHUTDOWN_GRACE_MS` (10 s). O publisher termina dentro do teto dos envios; o worker termina a transação corrente. Passado o prazo, o shutdown segue, e o rollback ao fechar a conexão devolve o trabalho para outra instância. Verificado com SIGTERM em `bun run start`: worker, publisher e consumer pararam, sem erro no log.
+- **Pool (estende D32):** o publisher usa 1 conexão por ciclo e o worker 1, porque processa em sequência. A validação passou a exigir `consumer (se ligado) + publisher (1, se ligado) + worker (1, se ligado) < DB_POOL_MAX`, senão a app não sobe. Com o padrão de 10: 5 + 1 + 1 = 7, e sobram 3 para o HTTP.
+- **Logs:** cada ciclo roda com `worker` no contexto do pino. O publisher loga quantos eventos publicou e cada falha (`eventId`, `orderingKey`); o worker loga cada transação avaliada (`transactionId`, `walletId`, `correlationId`, status, `failureCode`, tentativas, próxima tentativa) e cada falha.
+
+### D41. Testes do publisher e do worker
+
+- **Publisher** (`test/integration/workers/outbox-publisher.test.ts`): cada teste cria uma fila de eventos própria (`wager-events-test-<uuid>.fifo`) e, antes, marca como publicados os eventos que os testes anteriores deixaram no outbox. Os envios são contados por um spy que embrulha o `EventPublisher` real, sem substituí-lo.
+  - dois publishers sobre o mesmo outbox (ordem por wallet, nenhum envio a mais, nenhuma duplicata);
+  - instância morta antes de publicar;
+  - envio sem marcação, provocado por um trigger temporário (D37);
+  - falha de publicação com retry: a fila ainda não existe, o evento entra em backoff e os seguintes da wallet esperam; depois de a fila ser criada, sai tudo em ordem;
+  - evento do meio em backoff segurando os seguintes da wallet sem atrasar as outras.
+- **Worker** (`test/integration/workers/pending-reference-worker.test.ts`): REFUND antes da BET (com o `correlationId` original nos eventos), ROLLBACK antes do WIN (DEBIT), empurrão de uma dependente com backoff de 1 h, novas tentativas sem a referência (backoff exato e nenhum evento novo), limite esgotado (REJECTED `REFERENCE_NOT_FOUND`, evento e replay 422), replay depois da resolução, worker e 20 BETs HTTP simultâneas na mesma wallet, e dois workers sobre as mesmas 10 dependentes.
+- Depois de cada teste, o saldo de todas as wallets é conferido contra o ledger.
+
+## 9. Autenticação
 
 Fora do escopo implementado; a seção 2 do enunciado aceita essa decisão. O desenho que adotaríamos:
 - **IdP externo (Keycloak, OIDC).** Cada provedor de jogos é um client confidencial e obtém token via *client credentials*.
 - A API valida o JWT localmente (assinatura via JWKS em cache, `iss`, `aud`, `exp`). Um claim `provider_id` precisa ser igual ao `providerId` do corpo, senão a resposta é 403. Isso impede um provedor de submeter transações em nome de outro.
 - **Ponto de extensão no código:** `AuthGuard` no-op (`src/interfaces/http/auth/auth.guard.ts`), aplicado com `@UseGuards` no `WalletsController`, no `WageringController` e no `ProviderTransactionsController`. Um teste confere que ele está registrado. Os endpoints de health ficam abertos. A fila SQS é tratada como canal interno confiável, mas o `providerId` da mensagem passa pelas mesmas validações de domínio.
 
-## 9. Limitações conhecidas
+## 10. Limitações conhecidas
 
 - A LocalStack 4.14.0 está congelada e não recebe correções. Se a tag deixar de existir ou aparecer uma divergência de comportamento, a saída é o MiniStack (D1).
-- A aplicação ainda roda no host. O Dockerfile e o serviço `app` com réplicas entram na Etapa 5 ou 6.
+- A aplicação ainda roda no host. O Dockerfile e o serviço `app` com réplicas entram na Etapa 6.
 - Sem TLS entre a aplicação e as dependências locais (ambiente de desenvolvimento).
 - A app conecta como dono das tabelas. A imutabilidade não depende disso (triggers valem para todos), mas um role com privilégios mínimos seria a defesa em profundidade em produção (D20).
 - O `correlationId` não aparece no problem de JSON malformado, porque o parser de corpo roda antes do middleware de log que atribui o id.
-- Transações em PENDING_REFERENCE só são reavaliadas pelo worker da Etapa 5; até lá, ficam pendentes mesmo depois que a referência chega (D28).
 - Mensagens com erro permanente vão para a DLQ com o motivo, mas o provedor não é avisado automaticamente (D30).
 - Um long polling abortado no shutdown pode atrasar mensagens por até a visibilidade da fila (30 s), sem perdê-las (D33).
+- O publisher mantém a transação aberta durante os envios ao SQS. O teto por ciclo é o timeout de cada envio vezes os eventos de uma wallet no lote (D36).
+- Um evento que falha sempre (por exemplo, maior que o limite de 256 KB do SQS) segura os seguintes da wallet indefinidamente, porque o outbox não tem limite de tentativas (D15). A métrica de outbox lag (Etapa 6) é o alarme.
+- Duplicatas depois da janela de 5 min da FIFO chegam ao consumidor de eventos, que precisa deduplicar por `eventId` (D37).
+- A fila de eventos é ponto a ponto; mais de um consumidor pede SNS FIFO (D35).
+- Os eventos publicados ficam no outbox para sempre. O guard já permite apagar os publicados, mas não há job de retenção.

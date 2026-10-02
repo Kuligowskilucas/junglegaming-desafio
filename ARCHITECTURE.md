@@ -1,7 +1,5 @@
 # Arquitetura
 
-Este documento registra as decisões técnicas, os trade-offs e as limitações conhecidas. Ele cresce a cada etapa. O enunciado está em [`docs/DESAFIO.md`](docs/DESAFIO.md).
-
 ## 1. Stack e versões
 
 | Item | Versão | Observação |
@@ -82,7 +80,7 @@ O script `docker/sqs/init/ready.d/01-create-queues.sh` roda quando o LocalStack 
 | Fila | Atributos |
 |---|---|
 | `wager-transactions-dlq.fifo` | `FifoQueue=true`, retenção de 14 dias |
-| `wager-transactions.fifo` | `FifoQueue=true`, `ContentBasedDeduplication=false` (o produtor envia `MessageDeduplicationId=messageId`), `VisibilityTimeout=30`, `ReceiveMessageWaitTimeSeconds=20` (long polling), `RedrivePolicy={deadLetterTargetArn: DLQ, maxReceiveCount: SQS_MAX_RECEIVE_COUNT}` |
+| `wager-transactions.fifo` | `FifoQueue=true`, `ContentBasedDeduplication=false` (o produtor envia `MessageDeduplicationId=messageId`), `VisibilityTimeout=30`, `ReceiveMessageWaitTimeSeconds=20` (long polling), `RedrivePolicy={deadLetterTargetArn: DLQ, maxReceiveCount: SQS_MAX_RECEIVE_COUNT}` (10 desde a Etapa 5a, D31) |
 
 Alternativas descartadas:
 - **Criar na subida da aplicação:** em produção exigiria permissão de `CreateQueue` para a app e geraria corrida entre instâncias. Provisionamento é responsabilidade da infra (IaC), não do runtime.
@@ -511,16 +509,117 @@ Toda resposta de transação leva `Location: /wagering/transactions/:id`. No 422
 
 **Dependentes em PENDING_REFERENCE (P6):** não são processadas no mesmo pedido da referência. Isso alongaria a transação, encadearia efeitos e faria uma falha da dependente derrubar a referência. Ficam com o worker da Etapa 5, que pode ganhar um "empurrão": ao processar uma referência, reagendar para agora as dependentes que esperam por ela, com um índice parcial `(provider_id, reference_external_transaction_id) WHERE status = 'PENDING_REFERENCE'`.
 
-**Pendência para a Etapa 5: erros não persistidos não geram evento.** `WALLET_PLAYER_MISMATCH`, wallet inexistente e payload inválido (`VALIDATION_FAILED`, `INVALID_MONEY`, `INVALID_WAGER_TRANSACTION`) não criam linha em `wager_transactions` nem evento no outbox. Pelo HTTP, o provedor recebe o 4xx. **Pelo SQS, onde não há resposta, o provedor não ficaria sabendo.** A Etapa 5 precisa decidir o destino deles, por exemplo DLQ como erro permanente, com o motivo nos atributos da mensagem, e/ou um evento próprio de rejeição de entrada.
+**Pendência para a Etapa 5 (resolvida em D30): erros não persistidos não geram evento.** `WALLET_PLAYER_MISMATCH`, wallet inexistente e payload inválido (`VALIDATION_FAILED`, `INVALID_MONEY`, `INVALID_WAGER_TRANSACTION`) não criam linha em `wager_transactions` nem evento no outbox. Pelo HTTP, o provedor recebe o 4xx. **Pelo SQS, onde não há resposta, o provedor não ficaria sabendo.** A Etapa 5 precisa decidir o destino deles, por exemplo DLQ como erro permanente, com o motivo nos atributos da mensagem, e/ou um evento próprio de rejeição de entrada.
 
-## 7. Autenticação
+## 7. Consumer SQS
+
+Etapa 5a: o consumer da fila `wager-transactions.fifo` (seção 10 do enunciado), reaproveitando o `SubmitWagerTransaction` sem alterá-lo.
+
+### D29. Inbox na mesma transação, sem acoplar o caso de uso ao SQS
+
+São três camadas:
+- **`src/interfaces/sqs`:** o adaptador faz polling, valida o envelope, dá ack, aplica backoff e envia à DLQ. É o único que conhece o SQS.
+- **`src/application/messaging/HandleWagerTransactionRequested`:** abre a transação externa, grava o `InboxMessage` (PK `(consumer_name, message_id)`) e chama `SubmitWagerTransaction.execute` com `causationId = messageId`.
+- **O `SubmitWagerTransaction`:** não muda e não sabe que existe fila.
+
+**Mecanismo:** a propagação padrão do `em.transactional` no MikroORM 7 é `NESTED`, então o `TransactionRunner.run` interno do caso de uso vira **savepoint** da transação externa. Inbox, transação, lançamento, wallet e outbox confirmam juntos ou nada. A rede de segurança da E4 (unique → rollback → relê) continua valendo, agora com rollback do savepoint.
+
+**Ordem dos locks:** sempre PK do inbox → lock da wallet, então não há deadlock entre mensagens.
+
+**Contexto do MikroORM por mensagem:** fora do HTTP não há o contexto por requisição, e o `EntityManager` global recusa leituras fora de transação (`allowGlobalContext: false`). O consumer roda cada mensagem em `DatabaseContext.run` (`RequestContext.create`), o equivalente do middleware HTTP. Sem isso, a releitura do inbox no caminho de duplicata falhava e a mensagem ficava em retry; foi o que o primeiro teste de redelivery acusou.
+
+**Duplicatas e crash:**
+- **Entrega repetida:** o INSERT do inbox falha na PK → rollback → o handler relê o inbox e devolve `DUPLICATE` → ack, sem efeito.
+- **Entregas simultâneas** (visibilidade expirou e outra instância recebeu): o segundo INSERT espera a transação do primeiro e vira duplicata se o primeiro confirmar.
+- **Crash depois do commit e antes do ack:** a reentrega cai no inbox e recebe ack sem efeito.
+- **Crash antes do commit:** desfaz tudo, inclusive o inbox.
+- Uma segunda camada vem da idempotência da transação: outro `messageId` com a mesma `idempotencyKey` é replay.
+
+**`payloadHash` do inbox:** SHA-256 do JSON canônico de `{ type, data }` (`canonicalHash`, o mesmo de D13, agora em `domain/shared`). `messageId` e `occurredAt` ficam de fora. O mesmo `messageId` com outro payload → `InboxPayloadMismatchError` → DLQ com `INBOX_PAYLOAD_MISMATCH`; o efeito original fica intacto.
+
+**O inbox só guarda mensagens tratadas:** a linha nasce já processada, na mesma transação. Mensagens que vão para a DLQ não têm linha.
+
+### D30. Classificação de erros e destino dos não persistidos (fecha a pendência de D28)
+
+| Situação | Classe | Ação |
+|---|---|---|
+| PROCESSED, REJECTED ou PENDING_REFERENCE persistido; replay idempotente; duplicata do inbox | negócio/terminal | **ack** |
+| Corpo que não é JSON, envelope fora do schema, `type` desconhecido | permanente | **DLQ explícita**, `INVALID_MESSAGE` |
+| `INVALID_MONEY`, `INVALID_WAGER_TRANSACTION`, `WALLET_NOT_FOUND`, `WALLET_PLAYER_MISMATCH`, `IDEMPOTENCY_CONFLICT`, `DUPLICATE_EXTERNAL_TRANSACTION_ID`, `INBOX_PAYLOAD_MISMATCH` | permanente | DLQ explícita, com o código |
+| Banco indisponível, `55P03` (lock timeout), deadlock, falha do SQS | transitório | backoff (D31) |
+| Qualquer outro erro (bug, invariante) | desconhecido → **transitório** | backoff; se persistir, DLQ pelo `maxReceiveCount`. Nunca é descartado |
+
+**Destino dos erros não persistidos: DLQ explícita com atributos.** A mensagem vai para a DLQ com `MessageAttributes` `errorCode`, `errorMessage`, `consumerName`, `failedAt` e `receiveCount`, e então é apagada da fila principal. É a classificação do enunciado ("permanentes → DLQ"). Isso tira a mensagem do fluxo na hora, sem bloquear o grupo da wallet com reentregas inúteis, e a DLQ (14 dias) é a trilha de auditoria. A métrica de mensagens em DLQ (E6) alerta a operação. Alternativa descartada: ack + evento `WagerTransactionRequestRejected`, que criaria um evento fora do conjunto mínimo e não serviria para envelope ilegível. **Limitação:** o provedor não é avisado automaticamente de uma mensagem que foi para a DLQ.
+
+### D31. Backoff e DLQ
+
+| Opção de backoff | Resultado |
+|---|---|
+| **`ChangeMessageVisibility` exponencial (escolhida)** | espera = `min(SQS_RETRY_BASE_SECONDS × 2^(n−1), SQS_RETRY_MAX_SECONDS)`, com `n` = `ApproximateReceiveCount` (padrão 2 s × 2 com teto de 300 s, mesmo `backoffDelayMs` do domínio). Primeiras tentativas rápidas, sem estado local; se a chamada falhar, vale a visibilidade da fila (30 s) |
+| Só o visibility timeout da fila | Lento para falhas de segundos e agressivo para quedas longas: com 5 × 30 s, uma queda de 3 min mandaria mensagens válidas para a DLQ |
+
+**`maxReceiveCount` passou de 5 para 10:** 2+4+8+16+32+64+128+256+300 ≈ **13,5 min** de tolerância a falha transitória antes da DLQ.
+
+**DLQ híbrida:**
+- erro permanente conhecido → `SendMessage` na DLQ e depois `DeleteMessage`, com o motivo;
+- transitório e desconhecido → backoff até o `maxReceiveCount` mover. **O limite de tentativas é o da fila**, e vale também para crash e poison message.
+
+Envio e delete não são atômicos: um crash entre os dois reenvia a mensagem, que é reclassificada e reenviada. A FIFO da DLQ descarta a duplicata em 5 min, porque o `MessageDeduplicationId` é o `messageId` original. Por isso o envelope limita o `messageId` a 128 caracteres, o limite do SQS para esse campo.
+
+### D32. `MessageGroupId`, lote, paralelismo e o pool de conexões
+
+**Contrato do produtor:**
+- `MessageGroupId = walletId`;
+- `MessageDeduplicationId = messageId`;
+- corpo = envelope da seção 10 (`messageId` ≤ 128, `type: "WagerTransactionRequested"`, `occurredAt` ISO-8601, `data` com os campos do HTTP mais `idempotencyKey`);
+- atributo opcional `correlationId`. Sem ele, `correlationId = messageId`.
+
+O grupo é a unidade de concorrência do sistema: ordena por wallet e paraleliza entre wallets. Uma mensagem em backoff segura só o grupo dela (aquela wallet). **A correção não depende da FIFO** (inbox + idempotência + lock); outro group id só aumenta a disputa de lock.
+
+**Lote:** até `SQS_MAX_MESSAGES` (10) por receive, com long polling de `SQS_WAIT_TIME_SECONDS` (20 s).
+- As mensagens são agrupadas por `MessageGroupId`: **grupos em paralelo, sequência dentro do grupo**.
+- Se uma mensagem do grupo falha transitoriamente, as seguintes do mesmo grupo no lote voltam com `ChangeMessageVisibility 0`, e a FIFO só as entrega de novo depois da que falhou. Verificado: BET e REFUND da mesma BET no mesmo lote saem ambos PROCESSED, sem PENDING_REFERENCE.
+
+**Paralelismo limitado para não tirar conexões da API (ajuste pedido na aprovação).**
+- O consumer processa no máximo `SQS_CONSUMER_CONCURRENCY` mensagens ao mesmo tempo (`ConcurrencyLimit`, um semáforo com repasse direto da vaga). **Padrão: metade do `DB_POOL_MAX`**, com mínimo de 1.
+- Cada mensagem usa **uma conexão por vez**: tudo roda numa transação, e a releitura de duplicata só acontece depois do rollback. Então o consumer nunca ocupa mais que `SQS_CONSUMER_CONCURRENCY` conexões, e o restante do pool fica para o HTTP.
+- **A configuração valida** que, com o consumer ligado, `SQS_CONSUMER_CONCURRENCY < DB_POOL_MAX`; senão a app não sobe.
+- Alternativa considerada: um pool de conexões separado para o consumer, que garantiria isolamento total, mas exigiria uma segunda instância do MikroORM e o dobro de conexões no Postgres. O limite por semáforo atinge o mesmo objetivo com um pool só.
+
+### D33. Onde roda e shutdown
+
+**Onde roda:** no mesmo processo da API, ligado por `SQS_CONSUMER_ENABLED` (`true` no `.env.example`, `false` no `.env.test`; os testes ligam por app). O health continua disponível. Separar papéis (`APP_ROLE`) fica para a E6, se as réplicas do compose pedirem.
+
+**Ciclo de vida:** o `WagerTransactionConsumer` é um provider Nest. Inicia em `onApplicationBootstrap` e drena em **`beforeApplicationShutdown`**, que roda antes do MikroORM fechar as conexões. Em SIGTERM (`enableShutdownHooks` → `app.close()`):
+1. marca `stopping` e **aborta o long polling** em andamento (`AbortController` no `send` do SDK), sem esperar os 20 s;
+2. mensagens do lote que ainda não começaram → `ChangeMessageVisibility 0`, voltando na hora para outra instância;
+3. as que estão em andamento terminam e recebem ack, até `SQS_SHUTDOWN_GRACE_MS` (10 s);
+4. passado o prazo, o shutdown segue e loga. Se o processo morrer antes do commit, o rollback e a reentrega cuidam; se depois, o inbox deduplica.
+
+**Verificado:**
+- SIGTERM durante um long polling de 20 s encerrou em 53 ms;
+- com uma mensagem presa no lock da wallet, o `close()` esperou ela terminar, devolveu a seguinte do lote (visível de imediato, sem esperar os 30 s de visibilidade) e uma segunda instância a processou.
+
+**Limitação:** um receive abortado no meio pode deixar mensagens invisíveis sem que o cliente as tenha recebido; elas voltam após a visibilidade da fila (30 s). Atrasa, mas não perde.
+
+**Logs:** cada mensagem roda em `PinoLogger.runInContext` com `consumerName`, `sqsMessageId` e `receiveCount`, mais `messageId` e `correlationId` depois do parse. O desfecho loga `transactionId`, `walletId`, `providerId`, status, `failureCode` e `idempotentReplay`. Não loga payload financeiro.
+
+### D34. Testes do consumer
+
+- Cada teste cria um par FIFO próprio (`wager-test-<uuid>.fifo` + DLQ), com visibilidade de 2 s e `maxReceiveCount` 3, e o apaga no fim. A app aponta para ele com long polling de 1 s e backoff de 1 s, para os cenários durarem segundos.
+- Depois de cada teste: saldo de todas as wallets igual ao ledger, e fila principal e DLQ vazias.
+- **Cobertos:** caminho feliz (inbox, ack, `causationId`), redelivery sem duplicar efeito, crash entre commit e ack (o teste confirma a transação pelo handler sem apagar a mensagem e só depois liga o consumer), transitório com retry até dar certo e transitório esgotado indo para a DLQ (provocados de verdade, travando a wallet por SQL até o lock timeout disparar), permanentes direto na DLQ com o código, mesmo `messageId` com outro payload, rejeição de negócio confirmada sem retry, ordem por grupo, lote com várias wallets e os dois cenários de shutdown.
+- A espera por "o consumer está travado no lock da wallet" conta só esperas por lock de linha (`wait_event` `transactionid`/`tuple`). No `bun test --parallel`, arquivos de outros processos esperando o advisory lock de integração também aparecem como espera de lock e confundiam a contagem.
+- **Correção da Etapa 1:** o `bunfig.toml` não tem opção de timeout de teste, então o `timeout = 20000` que estava lá era ignorado em silêncio e valia o padrão de 5 s. Agora o `useIntegrationEnvironment()` chama `setDefaultTimeout(30_000)`, que vale para o arquivo corrente; por isso a chamada fica no helper que todo arquivo de integração já usa, e não no preload.
+
+## 8. Autenticação
 
 Fora do escopo implementado; a seção 2 do enunciado aceita essa decisão. O desenho que adotaríamos:
 - **IdP externo (Keycloak, OIDC).** Cada provedor de jogos é um client confidencial e obtém token via *client credentials*.
 - A API valida o JWT localmente (assinatura via JWKS em cache, `iss`, `aud`, `exp`). Um claim `provider_id` precisa ser igual ao `providerId` do corpo, senão a resposta é 403. Isso impede um provedor de submeter transações em nome de outro.
 - **Ponto de extensão no código:** `AuthGuard` no-op (`src/interfaces/http/auth/auth.guard.ts`), aplicado com `@UseGuards` no `WalletsController`, no `WageringController` e no `ProviderTransactionsController`. Um teste confere que ele está registrado. Os endpoints de health ficam abertos. A fila SQS é tratada como canal interno confiável, mas o `providerId` da mensagem passa pelas mesmas validações de domínio.
 
-## 8. Limitações conhecidas
+## 9. Limitações conhecidas
 
 - A LocalStack 4.14.0 está congelada e não recebe correções. Se a tag deixar de existir ou aparecer uma divergência de comportamento, a saída é o MiniStack (D1).
 - A aplicação ainda roda no host. O Dockerfile e o serviço `app` com réplicas entram na Etapa 5 ou 6.
@@ -528,4 +627,5 @@ Fora do escopo implementado; a seção 2 do enunciado aceita essa decisão. O de
 - A app conecta como dono das tabelas. A imutabilidade não depende disso (triggers valem para todos), mas um role com privilégios mínimos seria a defesa em profundidade em produção (D20).
 - O `correlationId` não aparece no problem de JSON malformado, porque o parser de corpo roda antes do middleware de log que atribui o id.
 - Transações em PENDING_REFERENCE só são reavaliadas pelo worker da Etapa 5; até lá, ficam pendentes mesmo depois que a referência chega (D28).
-- Erros de entrada não persistidos não geram evento; pelo SQS isso precisa de destino próprio (pendência da Etapa 5, D28).
+- Mensagens com erro permanente vão para a DLQ com o motivo, mas o provedor não é avisado automaticamente (D30).
+- Um long polling abortado no shutdown pode atrasar mensagens por até a visibilidade da fila (30 s), sem perdê-las (D33).

@@ -2,7 +2,7 @@
 
 Serviço financeiro distribuído que processa transações de apostas (BET, WIN, LOSS, REFUND, ROLLBACK) de múltiplos provedores, com idempotência persistente, ledger imutável e transactional outbox. O enunciado completo está em [`docs/DESAFIO.md`](docs/DESAFIO.md). As decisões técnicas e os trade-offs estão em [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
-**Status:** Etapas 1 a 4 concluídas: infra local, aplicação NestJS em Bun, config validada, logs JSON, health checks; o modelo de domínio (Money, Wallet, ledger, WagerTransaction, regras de BET/WIN/LOSS/REFUND/ROLLBACK, inbox, outbox e eventos); o schema PostgreSQL com as garantias no banco (constraints, índices e triggers), a persistência, os endpoints de wallet e a submissão de transações com idempotência, lock por wallet e outbox, testada com concorrência real.
+**Status:** Etapas 1 a 4 e 5a concluídas: infra local, aplicação NestJS em Bun, config validada, logs JSON, health checks; o modelo de domínio (Money, Wallet, ledger, WagerTransaction, regras de BET/WIN/LOSS/REFUND/ROLLBACK, inbox, outbox e eventos); o schema PostgreSQL com as garantias no banco (constraints, índices e triggers), a persistência, os endpoints de wallet, a submissão de transações com idempotência, lock por wallet e outbox, testada com concorrência real; e o consumer SQS com inbox, ack após o commit, backoff, DLQ e shutdown limpo.
 
 ## Pré-requisitos
 
@@ -86,6 +86,25 @@ Status da submissão (ARCHITECTURE.md, D27): 200 PROCESSED, 202 PENDING_REFERENC
 
 O `amount` precisa ter exatamente 2 casas decimais (`"25.00"`). O ledger vem do lançamento mais recente para o mais antigo, e o cursor é opaco e estável mesmo com lançamentos novos chegando durante a paginação.
 
+## Mensageria (SQS)
+
+Com `SQS_CONSUMER_ENABLED=true` (padrão no `.env.example`), o processo da API também consome `wager-transactions.fifo`. A mensagem segue o envelope da seção 10 do enunciado, com `MessageGroupId` = `walletId` e `MessageDeduplicationId` = `messageId` (contrato em ARCHITECTURE.md, D32):
+
+```bash
+BODY='{"messageId":"msg-123","type":"WagerTransactionRequested","occurredAt":"2026-07-29T15:00:00.000Z","data":{"providerId":"provider-a","externalTransactionId":"transaction-123","idempotencyKey":"provider-a:transaction-123","playerId":"<playerId>","walletId":"<walletId>","roundId":"round-987","gameId":"fortune-chimp","kind":"BET","money":{"amount":"25.00","currency":"BRL"}}}'
+docker compose exec sqs sh -c "awslocal sqs send-message \
+  --queue-url \"\$(awslocal sqs get-queue-url --queue-name wager-transactions.fifo --query QueueUrl --output text)\" \
+  --message-group-id <walletId> --message-deduplication-id msg-123 --message-body '$BODY'"
+
+curl -s localhost:3000/providers/provider-a/wagering/transactions/transaction-123   # aplicada pelo consumer
+
+# mensagens com erro permanente ficam na DLQ, com o motivo nos atributos
+docker compose exec sqs sh -c 'awslocal sqs receive-message --message-attribute-names All \
+  --queue-url "$(awslocal sqs get-queue-url --queue-name wager-transactions-dlq.fifo --query QueueUrl --output text)"'
+```
+
+Erros de negócio (por exemplo, saldo insuficiente) viram transação REJECTED e a mensagem recebe ack. Erros transitórios são retentados com backoff exponencial e só vão para a DLQ depois de `SQS_MAX_RECEIVE_COUNT` entregas (≈ 13,5 min). Erros permanentes (payload inválido, wallet inexistente, conflito de idempotência) vão direto para a DLQ com `errorCode`.
+
 ## Testes
 
 - **Unitários** (`test/unit`) não fazem I/O e não precisam da infra: domínio (`test/unit/domain`, incluindo regras de negócio, transições de status, hash de payload e um teste de propriedade do ledger com seed fixa), regra de dependência entre camadas (`test/unit/architecture`) e config.
@@ -93,6 +112,7 @@ O `amount` precisa ter exatamente 2 casas decimais (`"25.00"`). O ledger vem do 
 - O `bun test` define `NODE_ENV=test` e carrega o `.env.test` por cima do `.env`. Os testes usam o banco **`wagering_test`**, criado pelo init do Postgres, e não tocam no banco de desenvolvimento.
 - **Sem paralelismo entre arquivos que limpam o banco.** O `bun test` roda os arquivos em série por padrão, e os scripts nunca passam `--parallel`. Além disso, todo arquivo de integração chama `useIntegrationEnvironment()` (`test/support/integration.ts`). Ela toma um advisory lock no Postgres (`pg_advisory_lock`) numa conexão dedicada durante o arquivo inteiro. Mesmo com `bun test --parallel`, os arquivos de integração esperam uns pelos outros em vez de mexer nos dados de outro teste.
 - Cada arquivo fecha a sua app Nest e as suas conexões no `afterAll`, porque os arquivos dividem o mesmo processo.
+- **Consumer SQS** (`test/integration/sqs`): cada teste cria um par de filas FIFO próprio, com visibilidade curta, e cobre redelivery, crash entre commit e ack, retry transitório, DLQ, ordem por grupo e shutdown.
 - **Concorrência** (`test/concurrency`): requisições HTTP em paralelo contra o Postgres real. O cliente reenvia ao receber 503, respeitando o `Retry-After`, e cada cenário registra quantos 503 recebeu (resumo no fim da execução). Depois de cada teste, todas as wallets são conferidas contra o ledger. O `.env.test` usa `DB_POOL_MAX=20` para haver paralelismo real no banco.
 - **Limpeza sem desligar triggers:** os arquivos que usam tabelas chamam `resetDatabase()`, que derruba e recria o schema (`DROP SCHEMA` + migrations) dentro do lock. O ledger é imutável e nem os testes apagam linhas dele. O reset recusa bancos cujo nome não termine em `_test`.
 
@@ -110,12 +130,20 @@ Toda a configuração vem de variáveis de ambiente, validadas na subida. Com al
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | — | Lidas pelo SDK da AWS; no emulador, qualquer valor serve (`test`) |
 | `SQS_ENDPOINT` | — | Endpoint do emulador; sem ele, o SDK usa a AWS real |
 | `SQS_WAGER_QUEUE_NAME`, `SQS_WAGER_DLQ_NAME` | — | Nomes das filas FIFO (precisam terminar em `.fifo`) |
-| `SQS_MAX_RECEIVE_COUNT` | 5 | Entregas antes de a mensagem ir para a DLQ (usado na criação da fila) |
+| `SQS_MAX_RECEIVE_COUNT` | 10 | Entregas antes de a mensagem ir para a DLQ (usado na criação da fila) |
+| `SQS_CONSUMER_ENABLED` | false | Liga o consumer no processo da API (`true` no `.env.example`) |
+| `SQS_CONSUMER_NAME` | wager-transactions-consumer | Nome do consumer no inbox |
+| `SQS_CONSUMER_CONCURRENCY` | metade de `DB_POOL_MAX` | Mensagens processadas ao mesmo tempo; precisa ser menor que `DB_POOL_MAX` |
+| `SQS_WAIT_TIME_SECONDS` | 20 | Long polling por receive |
+| `SQS_MAX_MESSAGES` | 10 | Mensagens por receive |
+| `SQS_RETRY_BASE_SECONDS`, `SQS_RETRY_MAX_SECONDS` | 2, 300 | Backoff exponencial dos erros transitórios |
+| `SQS_SHUTDOWN_GRACE_MS` | 10000 | Tempo para concluir mensagens em andamento no SIGTERM |
 | `DB_LOCK_TIMEOUT_MS` | 2000 | Espera máxima pelo lock de uma wallet; além disso, 503 retryable |
 | `HEALTH_CHECK_TIMEOUT_MS` | 1000 | Timeout de cada dependência no `/health/ready` |
 
 ## Solução de problemas
 
+- **Fila criada com `maxReceiveCount` antigo:** o LocalStack não persiste estado; `docker compose up -d --force-recreate sqs` recria as filas com o valor do `.env`.
 - **Porta 5432 ou 5433 ocupada:** troque `DB_PORT` no `.env`.
 - **O banco `wagering_test` não existe:** o init do Postgres só roda com o volume vazio. Rode `docker compose down -v && docker compose up -d --wait`.
 - **Logs legíveis no terminal:** `bun run dev | bunx pino-pretty`.

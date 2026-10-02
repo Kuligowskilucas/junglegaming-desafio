@@ -1,4 +1,4 @@
-import { afterAll, beforeAll } from "bun:test";
+import { afterAll, beforeAll, setDefaultTimeout } from "bun:test";
 import { GetQueueUrlCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { SQL, type ReservedSQL } from "bun";
 import { AppConfig } from "../../src/infrastructure/config/app-config";
@@ -7,8 +7,10 @@ const integrationTestsLockKey = 4_271_001;
 const lockWaitTimeoutMs = 300_000;
 const preflightTimeoutMs = 3_000;
 const infrastructureHint = "rode `docker compose up -d --wait` antes dos testes de integração";
+const integrationTestTimeoutMs = 30_000;
 
 export function useIntegrationEnvironment(): void {
+  setDefaultTimeout(integrationTestTimeoutMs);
   let pool: SQL | undefined;
   let lockConnection: ReservedSQL | undefined;
 

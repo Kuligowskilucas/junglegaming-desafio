@@ -26,7 +26,7 @@ services:
       AWS_DEFAULT_REGION: ${AWS_REGION:?copie .env.example para .env}
       SQS_WAGER_QUEUE_NAME: ${SQS_WAGER_QUEUE_NAME:?copie .env.example para .env}
       SQS_WAGER_DLQ_NAME: ${SQS_WAGER_DLQ_NAME:?copie .env.example para .env}
-      SQS_MAX_RECEIVE_COUNT: ${SQS_MAX_RECEIVE_COUNT:-5}
+      SQS_MAX_RECEIVE_COUNT: ${SQS_MAX_RECEIVE_COUNT:-10}
     ports:
       - "4566:4566"
     volumes:

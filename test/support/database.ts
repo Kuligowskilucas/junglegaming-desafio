@@ -54,3 +54,10 @@ export async function expectConstraintViolation(operation: Promise<unknown>, con
   expect((failure as { constraint?: string }).constraint).toBe(constraint);
   return failure as Error;
 }
+
+export async function rowLockWaiters(sql: SQL): Promise<number> {
+  const [{ count }] = await sql`
+    SELECT count(*)::int AS count FROM pg_stat_activity
+     WHERE datname = current_database() AND wait_event_type = 'Lock' AND wait_event IN ('transactionid', 'tuple')`;
+  return count as number;
+}

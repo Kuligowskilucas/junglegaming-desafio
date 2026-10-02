@@ -91,7 +91,7 @@ Alternativas descartadas:
 
 A deduplicação e a ordenação do FIFO são **otimização**. As garantias de idempotência e consistência ficam no banco (Etapas 3 a 5).
 
-### D3. Mapeamento MikroORM: records de persistência + mappers
+### D3. Mapeamento MikroORM: records de persistência + mappers (aplicado em D21)
 
 | Opção | Resultado |
 |---|---|
@@ -225,6 +225,7 @@ O enunciado permite adaptar assinaturas desde que as garantias sejam preservadas
 
   O lançamento devolvido é o que a Etapa 4 persiste na mesma transação SQL e usa no `WalletBalanceChanged`.
 - `debit` além do saldo lança `InsufficientBalanceError`, um erro de invariante: o caminho de negócio consulta `canDebit` antes e transforma o resultado em `FailureCode` (D12). O saldo nunca fica negativo, nem em memória.
+- Cada lançamento carrega `walletVersion`, a versão da wallet que ele produziu (OPENING = 1). É a ordem total por wallet usada no schema e no cursor (D17, D22).
 - **`version = 1 + número de lançamentos da wallet, sem contar o OPENING`.** `Wallet.open` cria com `version = 1` e já devolve o lançamento CREDIT de abertura quando o saldo inicial é positivo, como no exemplo da seção 9 (saldo 1000.00, version 1). Cada `debit` ou `credit` posterior soma 1. LOSS e rejeições não mexem na version.
 - O `WalletLedgerEntry` é estruturalmente imutável: campos `readonly`, `Object.freeze` e nenhum método de transição. As datas do domínio são guardadas como epoch e entregues como cópias, porque `Date` é mutável em JS.
 - Um teste de propriedade aplica 1000 movimentos aleatórios, com seed fixa, e confere: saldo igual ao reconstruído pelo ledger, todos os lançamentos balanceados, `balanceBefore` de cada um igual ao `balanceAfter` do anterior, saldo nunca negativo e `version = 1 + lançamentos sem o OPENING`.
@@ -312,15 +313,138 @@ Factories e transições recebem `id`, `entryId` e `at` explicitamente. Os teste
 
 Para não passar vazio, o teste exige que `src/domain` tenha arquivos, e um auto-teste prova que o scanner reconhece cada forma de import. Verificado manualmente: um arquivo de prova com `import "@nestjs/common"` e um `import type` da infraestrutura fez o teste falhar apontando as duas violações.
 
-## 5. Autenticação
+## 5. Persistência e API de wallets
+
+Etapa 3: o domínio chega ao PostgreSQL por migrations escritas à mão, records `defineEntity`, mappers e repositórios atrás de portas da aplicação. Os três endpoints de wallet ficam atrás de um `AuthGuard` no-op.
+
+### D17. Schema e tabela de garantias
+
+São 6 migrations em `src/infrastructure/database/migrations`, uma por assunto, todas com `up` e `down`: `wallets`, `wager_transactions`, `wallet_ledger_entries`, os triggers de coerência, `inbox_messages` e `outbox_messages`. Cada regra tem um nome `<tabela>_<regra>`. **As regras impostas por trigger levantam `check_violation` com `CONSTRAINT = '<nome>'`.** Assim, `CHECK`, `UNIQUE`, FK e trigger chegam à aplicação e aos testes do mesmo jeito, pelo campo `constraint` do erro.
+
+| Garantia | Onde |
+|---|---|
+| Uma wallet por `player_id + currency` | `wallets_player_currency_key` |
+| Saldo nunca negativo | `wallets_balance_non_negative`; o ledger também tem `wallet_ledger_entries_balances_non_negative` |
+| `version` sobe exatamente 1 quando o saldo muda e não muda quando o saldo não muda | trigger `wallets_version_follows_balance` |
+| Identidade da wallet imutável | trigger `wallets_identity_immutable` |
+| Idempotência persistente | `wager_transactions_idempotency_key` = `UNIQUE (provider_id, idempotency_key)` (D19) |
+| Um id externo por provider; resolução de referência | `wager_transactions_external_id_key` |
+| Uma reversão por referência, qualquer que seja o tipo (P7 da E2) | índice único parcial `wager_transactions_one_reversal_per_reference` em `reference_transaction_id` `WHERE kind IN ('REFUND','ROLLBACK') AND status = 'PROCESSED'` |
+| Regras de kind iguais às do domínio | `wager_transactions_amount_by_kind`, `_reference_by_kind`, `_no_self_reference`, `_opening_is_internal` |
+| Coerência entre status e campos | `wager_transactions_*_by_status` (failure code, `processed_at`, `observed_balance`, agenda de PENDING_REFERENCE, referência resolvida) |
+| Transação terminal imutável, payload imutável, sem volta para PENDING, sem DELETE/TRUNCATE | trigger `wager_transactions_guard` (`_terminal_immutable`, `_payload_immutable`, `_transition_valid`, `_append_only`) |
+| No máximo um lançamento por transação por wallet | `wallet_ledger_entries_one_per_transaction` |
+| Lançamento só aponta para transação da mesma wallet e na moeda da wallet | FKs compostas `wallet_ledger_entries_transaction_wallet_fkey` e `_wallet_currency_fkey` |
+| `balance_before ± amount = balance_after` | `wallet_ledger_entries_arithmetic` (exato em `numeric`) |
+| Ordem total e densa por wallet | `wallet_ledger_entries_wallet_version_key` (D22) |
+| Ledger imutável | trigger `wallet_ledger_entries_append_only` (UPDATE, DELETE e TRUNCATE, por linha e por comando) |
+| Toda alteração de saldo tem lançamento | constraint trigger deferido `wallets_balance_matches_ledger` |
+| O lançamento continua o anterior | constraint trigger deferido `wallet_ledger_entries_chained` |
+| Todo lançamento corresponde a uma transação PROCESSED, não LOSS, de mesmo valor e moeda e com a direção do kind (ROLLBACK = o inverso do lançamento da referência) | constraint trigger deferido `wallet_ledger_entries_match_transaction` |
+| Deduplicação persistente de mensagens | PK `inbox_messages_pkey (consumer_name, message_id)` |
+| Envelope do outbox coerente com as colunas | `outbox_messages_payload_envelope` |
+| Evento pendente não se perde; conteúdo imutável; publicado só uma vez | trigger `outbox_messages_guard` (`_retention`, `_content_immutable`, `_published_once`) |
+
+**Coerência deferida.** Os três *constraint triggers* são `DEFERRABLE INITIALLY DEFERRED`: rodam no COMMIT, quando wallet, transação e lançamento já estão todos gravados. As FKs continuam imediatas, então a ordem de inserção é fixa (wallet → transação → lançamento → outbox). As mensagens nomeiam a regra e os valores, e o `DETAIL` traz `chave=valor` para log. Exemplo real:
+
+```
+wallet_ledger_entries_match_transaction: entry … for transaction … (ROLLBACK of WIN …) has direction CREDIT, expected DEBIT
+DETAIL: wallet_id=… wallet_version=3 transaction_id=… kind=ROLLBACK reference_transaction_id=… reference_direction=CREDIT expected_direction=DEBIT received_direction=CREDIT
+```
+
+**Índices para os workers.** `wager_transactions_pending_reference_due` (parcial em PENDING_REFERENCE, por `next_reference_attempt_at`) e `outbox_messages_pending_due` (parcial em pendentes, por `coalesce(next_attempt_at, occurred_at), id`) servem às Etapas 5 e 6. O `wallet_ledger_entries_wallet_version_key` é também o índice da paginação.
+
+### D18. Dinheiro no banco: `numeric(19,2)`
+
+| Opção | Resultado |
+|---|---|
+| **`numeric(19,2)` (escolhida)** | Legível em auditoria; a aritmética do lançamento é um `CHECK` exato; `SUM()` da reconciliação sai em reais; o `pg` devolve `"975.00"`, que entra direto em `Money.from` com a mesma regra de 2 casas; os 17 dígitos inteiros são exatamente o teto `OUT_OF_RANGE` do domínio |
+| `bigint` de centavos | Igual ao interno do domínio, mas ilegível em SQL ad hoc, obrigaria o domínio a expor centavos e **não comporta o teto do domínio** (`int8` vai até 92.233.720.368.547.758,07) |
+
+A moeda fica em `char(3)` com `CHECK (currency ~ '^[A-Z]{3}$')`. Observação para quem usa o `Bun.SQL` em testes: no protocolo binário ele devolve o `numeric` zero como `"0"`; os testes fazem `::text` nas asserções. A aplicação usa o `pg`, que sempre devolve as 2 casas.
+
+### D19. Escopo da idempotency key: por provider
+
+`UNIQUE (provider_id, idempotency_key)` e `UNIQUE (provider_id, external_transaction_id)`. Com unicidade global, o provider A poderia usar a key `provider-b:tx-1` e bloquear o B, ou receber o replay da resposta do B, com o saldo de um jogador alheio. Com a key separada por provider, a busca de replay é sempre `(provider_id, idempotency_key)` e usa o próprio índice. O OPENING usa o provider reservado `internal`.
+
+### D20. Imutabilidade e limpeza do banco de testes
+
+Os triggers `BEFORE UPDATE OR DELETE` (por linha) e `BEFORE TRUNCATE` (por comando) disparam para qualquer usuário, inclusive o dono e superusuários; a única exceção é `session_replication_role = replica`, que a aplicação nunca usa. `TRUNCATE wallets CASCADE` também falha, porque os triggers de TRUNCATE disparam nas tabelas alcançadas pelo cascade. Defesa em profundidade sugerida para produção (fora do escopo): rodar a app com um role sem `UPDATE`, `DELETE` e `TRUNCATE` no ledger.
+
+**Os testes nunca limpam com DML.** `resetDatabase()` (`test/support/database.ts`) roda `DROP SCHEMA public CASCADE; CREATE SCHEMA public` e depois o `migrator.up()`, uma vez por arquivo, dentro do advisory lock (D8). DDL não passa pelos triggers de DML, então **os triggers ficam ativos em todos os testes**, sem bypass. Dentro de um arquivo, os testes se isolam com ids novos. O reset recusa qualquer banco cujo nome não termine em `_test`. Alternativa descartada: `session_replication_role = replica` + `TRUNCATE`, que exige superusuário e desliga também as FKs.
+
+### D21. Persistência: records, mappers, repositórios e transação
+
+- **Records** `defineEntity` em `src/infrastructure/database/records`, só dados e sem relações declaradas. **Mappers** convertem record ↔ domínio via `rehydrate` e `Money.from`/`toJSON`.
+- **Portas** em `src/application/ports` (abstract classes que servem de token de DI): `WalletRepository`, `WagerTransactionRepository`, `WalletLedgerRepository`, `OutboxRepository`, `TransactionRunner`, `Clock`, `IdGenerator`. **Adaptadores** em `src/infrastructure/database/repositories` e `src/infrastructure/system` (`new Date()`, `Bun.randomUUIDv7()`). Os casos de uso não importam Nest; são ligados por `useFactory` no `WalletsModule`.
+- **Inserções com `em.insert`**, que executa na hora e na ordem chamada. Records sem relações não informam ao Unit of Work a ordem das FKs, então o `persist` + `flush` poderia inserir fora de ordem.
+- **Atualização da wallet:** `findByIdForUpdate` = `em.findOne(…, { lockMode: LockMode.PESSIMISTIC_WRITE, refresh: true })` (`SELECT … FOR UPDATE`, exige transação aberta) e `update` = `em.assign` + `flush` sobre o record carregado. É o caminho de D3 que a Etapa 4 usa.
+- **Transação:** `MikroOrmTransactionRunner.run(work)` = `em.transactional(() => work())`. O MikroORM guarda o fork transacional num `AsyncLocalStorage`, e os repositórios, que recebem o `EntityManager` global, entram nele automaticamente. **Cuidado:** um `em.fork()` comum tem `useContext: false` e ignora esse contexto, gravando fora da transação. Os testes que montam repositórios à mão usam `fork({ useContext: true })`. Isso foi descoberto quando o trigger `wallets_balance_matches_ledger` barrou um commit em que a wallet tinha sido gravada fora da transação.
+- **Tradução de erros:** `UniqueConstraintViolationException` com `constraint = 'wallets_player_currency_key'` vira `WalletAlreadyExistsError`. Qualquer outra violação sobe como está (bug → 500).
+- **SQL cru:** nenhum na aplicação até aqui (registro de D3).
+
+`POST /wallets` faz, numa transação SQL: `Wallet.open` → wallet; se o saldo inicial for positivo, `WagerTransaction.opening` → transação → lançamento CREDIT de abertura → outbox com `WagerTransactionProcessed` e `WalletBalanceChanged` (P6), que levam o `correlationId` da requisição. Se a wallet já existir, a aplicação busca o id da existente depois do rollback e o devolve no 409.
+
+### D22. Paginação do ledger por cursor
+
+`GET /wallets/:walletId/ledger?cursor=&limit=` devolve `{ items, nextCursor }`, do mais recente para o mais antigo, com `limit` padrão 50 e máximo 200. O cursor é `base64url(JSON.stringify({ w: walletId, v: walletVersion }))`, onde `v` é a última versão devolvida, e a próxima página busca `wallet_version < v` (busca `limit + 1` para saber se há próxima).
+
+**Por que é estável:**
+- a chave `(wallet_id, wallet_version)` é única e imutável (ledger append-only);
+- `wallet_version` é atribuída sob o lock da wallet e cresce estritamente, então um lançamento novo sempre recebe uma versão maior que todas as existentes: aparece antes da primeira página e nunca entre páginas já lidas;
+- nada pode ser apagado.
+
+Comparação: `OFFSET` desloca as páginas a cada inserção, e um keyset por `created_at` empata e permite inserção "no meio" quando o relógio de outra instância está atrasado. O teste comprova isso: inserindo 3 lançamentos durante a paginação, um deles com `created_at` no passado, as páginas seguintes continuam exatas. Um INSERT "no meio" (versão já existente) falha em `wallet_ledger_entries_wallet_version_key`.
+
+O cursor é opaco e tem escopo: um cursor de outra wallet, adulterado ou com versão inválida dá 400 `INVALID_CURSOR`.
+
+### D23. Convenção de erros HTTP (RFC 9457)
+
+Todo erro sai como `application/problem+json`, gerado pelo filtro global `ProblemDetailsFilter`:
+
+```json
+{
+  "type": "urn:wagering:problem:wallet-already-exists",
+  "title": "Wallet already exists",
+  "status": 409,
+  "detail": "Player … already has a BRL wallet",
+  "instance": "/wallets",
+  "code": "WALLET_ALREADY_EXISTS",
+  "retryable": false,
+  "correlationId": "…",
+  "walletId": "…"
+}
+```
+
+`code` é o identificador estável para máquina, `retryable` diz se reenviar o mesmo pedido pode dar certo, e as extensões variam por problema (`errors` na validação, `reason` em `INVALID_MONEY`, `walletId` no 409).
+
+| Situação | Status | `code` | `retryable` |
+|---|---|---|---|
+| Corpo, parâmetro ou query fora do schema (zod via Standard Schema) | 400 | `VALIDATION_FAILED` + `errors[]` | false |
+| JSON malformado | 400 | `MALFORMED_REQUEST` | false |
+| Money inválido | 400 | `INVALID_MONEY` + `reason` | false |
+| Cursor inválido | 400 | `INVALID_CURSOR` | false |
+| Wallet inexistente | 404 | `WALLET_NOT_FOUND` | false |
+| Rota inexistente | 404 | `ROUTE_NOT_FOUND` | false |
+| Wallet duplicada | 409 | `WALLET_ALREADY_EXISTS` + `walletId` | false |
+| Banco inalcançável, deadlock, lock timeout, falha de serialização | 503 + `Retry-After: 1` | `DEPENDENCY_UNAVAILABLE` | true |
+| Erro inesperado ou de invariante | 500 | `INTERNAL_ERROR` | false |
+
+Reservado para a Etapa 4, na mesma convenção: 400 `INVALID_WAGER_TRANSACTION` (+ `reason`) e `MISSING_IDEMPOTENCY_KEY`; 409 `IDEMPOTENCY_CONFLICT`; 422 para rejeição de negócio (com o resultado da transação e o `failureCode`); 202 para PENDING_REFERENCE.
+
+O `/health/ready` define o 503 por `@Res({ passthrough: true })` e não passa pelo filtro, mantendo o formato próprio de D6.
+
+## 6. Autenticação
 
 Fora do escopo implementado; a seção 2 do enunciado aceita essa decisão. O desenho que adotaríamos:
 - **IdP externo (Keycloak, OIDC).** Cada provedor de jogos é um client confidencial e obtém token via *client credentials*.
 - A API valida o JWT localmente (assinatura via JWKS em cache, `iss`, `aud`, `exp`). Um claim `provider_id` precisa ser igual ao `providerId` do corpo, senão a resposta é 403. Isso impede um provedor de submeter transações em nome de outro.
-- **Ponto de extensão no código:** um `AuthGuard` no-op aplicado aos controllers de negócio, que entra na Etapa 4. Os endpoints de health ficam abertos. A fila SQS é tratada como canal interno confiável, mas o `providerId` da mensagem passa pelas mesmas validações de domínio.
+- **Ponto de extensão no código:** `AuthGuard` no-op (`src/interfaces/http/auth/auth.guard.ts`), aplicado com `@UseGuards` no `WalletsController` e, na Etapa 4, nos controllers de wagering. Um teste confere que ele está registrado. Os endpoints de health ficam abertos. A fila SQS é tratada como canal interno confiável, mas o `providerId` da mensagem passa pelas mesmas validações de domínio.
 
-## 6. Limitações conhecidas
+## 7. Limitações conhecidas
 
 - A LocalStack 4.14.0 está congelada e não recebe correções. Se a tag deixar de existir ou aparecer uma divergência de comportamento, a saída é o MiniStack (D1).
 - A aplicação ainda roda no host. O Dockerfile e o serviço `app` com réplicas entram na Etapa 5 ou 6.
 - Sem TLS entre a aplicação e as dependências locais (ambiente de desenvolvimento).
+- A app conecta como dono das tabelas. A imutabilidade não depende disso (triggers valem para todos), mas um role com privilégios mínimos seria a defesa em profundidade em produção (D20).
+- O `correlationId` não aparece no problem de JSON malformado, porque o parser de corpo roda antes do middleware de log que atribui o id.

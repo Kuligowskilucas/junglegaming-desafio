@@ -2,7 +2,7 @@
 
 Serviço financeiro distribuído que processa transações de apostas (BET, WIN, LOSS, REFUND, ROLLBACK) de múltiplos provedores, com idempotência persistente, ledger imutável e transactional outbox. O enunciado completo está em [`docs/DESAFIO.md`](docs/DESAFIO.md). As decisões técnicas e os trade-offs estão em [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
-**Status:** Etapas 1 (fundação) e 2 (domínio puro) concluídas: infra local, aplicação NestJS em Bun, config validada, MikroORM com migrations, health checks, logs JSON e o modelo de domínio (Money, Wallet, ledger, WagerTransaction, regras de BET/WIN/LOSS/REFUND/ROLLBACK, inbox, outbox e eventos), com testes unitários e de arquitetura.
+**Status:** Etapas 1 a 3 concluídas: infra local, aplicação NestJS em Bun, config validada, logs JSON, health checks; o modelo de domínio (Money, Wallet, ledger, WagerTransaction, regras de BET/WIN/LOSS/REFUND/ROLLBACK, inbox, outbox e eventos); e o schema PostgreSQL com as garantias no banco (constraints, índices e triggers), a persistência e os endpoints de wallet.
 
 ## Pré-requisitos
 
@@ -49,20 +49,38 @@ docker compose exec sqs sh -c 'awslocal sqs get-queue-attributes --attribute-nam
 | `bun test` | Todos os testes (unitários e de integração) |
 | `bun run test:unit` | Só os testes sem I/O (domínio, arquitetura, config) |
 | `bun run test:integration` | Só os testes contra Postgres e SQS reais |
-| `bun run db:migrate` | Aplica as migrations pendentes |
+| `bun run db:migrate` | Aplica as migrations pendentes (6: wallets, transações, ledger, coerência, inbox, outbox) |
 | `bun run db:migrate:down` | Reverte a última migration |
 | `bun run db:migration:create` | Cria uma migration em branco (SQL escrito à mão) |
 | `bun run db:migration:list` | Lista as migrations executadas |
 
 Para rodar as migrations no banco de testes: `NODE_ENV=test bun run db:migrate`. O Bun passa a carregar o `.env.test`, que aponta para `wagering_test`.
 
+## API
+
+Os erros saem em `application/problem+json` (RFC 9457) com `code`, `retryable` e `correlationId`. A tabela completa está em ARCHITECTURE.md, D23.
+
+```bash
+# criar wallet (201 + Location); com saldo inicial > 0 grava também o OPENING e o crédito no ledger
+curl -si -X POST localhost:3000/wallets -H 'content-type: application/json' \
+  -d '{"playerId":"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1","initialBalance":{"amount":"1000.00","currency":"BRL"}}'
+# repetir o mesmo player e moeda → 409 WALLET_ALREADY_EXISTS com o walletId existente
+
+curl -s localhost:3000/wallets/<walletId>
+curl -s 'localhost:3000/wallets/<walletId>/ledger?limit=50'                 # { items, nextCursor }
+curl -s 'localhost:3000/wallets/<walletId>/ledger?limit=50&cursor=<nextCursor>'
+```
+
+O `amount` precisa ter exatamente 2 casas decimais (`"25.00"`). O ledger vem do lançamento mais recente para o mais antigo, e o cursor é opaco e estável mesmo com lançamentos novos chegando durante a paginação.
+
 ## Testes
 
 - **Unitários** (`test/unit`) não fazem I/O e não precisam da infra: domínio (`test/unit/domain`, incluindo regras de negócio, transições de status, hash de payload e um teste de propriedade do ledger com seed fixa), regra de dependência entre camadas (`test/unit/architecture`) e config.
-- **Integração** (`test/integration`) usam PostgreSQL e LocalStack reais, sem mocks. A infra precisa estar de pé (`docker compose up -d --wait`). Se não estiver, o teste falha na hora com essa instrução.
+- **Integração** (`test/integration`) usam PostgreSQL e LocalStack reais, sem mocks: migrations (up → down passo a passo → up), cada constraint e trigger violado por SQL, a coerência saldo ↔ ledger ↔ transação no COMMIT, repositórios e os endpoints de wallet (atomicidade, 10 POSTs simultâneos, cursor estável). A infra precisa estar de pé (`docker compose up -d --wait`). Se não estiver, o teste falha na hora com essa instrução.
 - O `bun test` define `NODE_ENV=test` e carrega o `.env.test` por cima do `.env`. Os testes usam o banco **`wagering_test`**, criado pelo init do Postgres, e não tocam no banco de desenvolvimento.
 - **Sem paralelismo entre arquivos que limpam o banco.** O `bun test` roda os arquivos em série por padrão, e os scripts nunca passam `--parallel`. Além disso, todo arquivo de integração chama `useIntegrationEnvironment()` (`test/support/integration.ts`). Ela toma um advisory lock no Postgres (`pg_advisory_lock`) numa conexão dedicada durante o arquivo inteiro. Mesmo com `bun test --parallel`, os arquivos de integração esperam uns pelos outros em vez de mexer nos dados de outro teste.
 - Cada arquivo fecha a sua app Nest e as suas conexões no `afterAll`, porque os arquivos dividem o mesmo processo.
+- **Limpeza sem desligar triggers:** os arquivos que usam tabelas chamam `resetDatabase()`, que derruba e recria o schema (`DROP SCHEMA` + migrations) dentro do lock. O ledger é imutável e nem os testes apagam linhas dele. O reset recusa bancos cujo nome não termine em `_test`.
 
 ## Configuração
 
